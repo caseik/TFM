@@ -1,0 +1,3 @@
+model,variant,train,val,test,lora,augmentation
+dinov2_vitb14,embeddings,7010,1502,0,False,False
+dinov2_vitb14,lora,7010,1502,1502,0,False
