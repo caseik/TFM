@@ -4,13 +4,14 @@ import pandas as pd
 
 @dataclass
 class ExperimentRecord:
-    model: str
-    variant: str
+    input_mode: str
+    runner: str
+    feature_extractor: str
     train: int
     val: int
     test: int
     lora: bool
-    augmentation: str
+    augmentation: bool
 
 
 class ExperimentLogger:
@@ -20,8 +21,9 @@ class ExperimentLogger:
     def register_batch(self, experiments):
         for experiment in experiments:
             record = ExperimentRecord(
-                model=experiment["model"],
-                variant=experiment["variant"],
+                input_mode=experiment["input_mode"],
+                runner=experiment["runner"],
+                feature_extractor=experiment["feature_extractor"],
                 train=experiment["train"],
                 val=experiment["val"],
                 test=experiment["test"],

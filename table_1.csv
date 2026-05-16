@@ -1,3 +1,3 @@
-model,variant,train,val,test,lora,augmentation
-dinov2_vitb14,embeddings,7010,1502,0,False,False
-dinov2_vitb14,lora,7010,1502,1502,0,False
+input_mode,runner,feature_extractor,train,val,test,lora,augmentation
+images,resnet50,none,7010,0,1502,0,False
+embeddings,mlp,dinov2_vitb14,7010,1502,1502,1502,False

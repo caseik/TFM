@@ -1,6 +1,6 @@
                          +----------------------+
                          |       main.py        |
-                         |  Orquestador global  |
+                         |  Global orchestrator |
                          +----------+-----------+
                                     |
                                     v
@@ -8,10 +8,10 @@
                     |                                |
                     v                                v
         +----------------------+       +----------------------+
-        |   dataset_manager    |       |   experiment_logger  |
+        |   dataset_manager    |       |  experiment_logger   |
         |----------------------|       |----------------------|
-        | - download/cache     |       | Tabla 1 (input exp.) |
-        | - load HAM10000      |       | config experimental  |
+        | - download/cache     |       | Table 1 (exp. plan)  |
+        | - load HAM10000      |       | experimental config  |
         +----------+-----------+       +----------------------+
                    |
                    v
@@ -19,25 +19,33 @@
         |    split_manager     |
         |----------------------|
         | - create_splits()    |
-        | - stratified split   |
-        | - patient split      |
+        +----------+-----------+
+                   |
+                   v
+        +----------------------+
+        |  feature_extractor   |
+        |----------------------|
+        | - optional stage     |
+        | - image -> embedding |
+        | - skipped if none    |
         +----------+-----------+
                    |
                    v
       +------------+--------------------------------------+
       |                model runners                      |
       |---------------------------------------------------|
-      | embeddings_runner.py                              |
-      | finetuning_runner.py                              |
+      | mlp_runner.py                                     |
+      | centroid_runner.py                                |
+      | resnet_runner.py                                  |
       | lora_runner.py                                    |
       +----------------------+----------------------------+
                              |
                              v
                 +------------+----------------+
-                |      metrics_generator      |
+                |    metrics_generator        |
                 |-----------------------------|
-                | Tabla 2 (accuracy/clases)  |
-                | Tabla 3 (FN clínicos)      |
+                | Table 2 (accuracy/classes) |
+                | Table 3 (clinical FN)      |
                 +-----------------------------+
 
 
