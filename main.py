@@ -1,12 +1,26 @@
 from dataset_manager import DatasetManager
 from experiment_logger import ExperimentLogger
 from split_manager import SplitManager
+from feature_extractor import FeatureExtractor
+from model_runners.mlp_runner import MLPRunner
+from model_runners.centroid_runner import CentroidRunner
 
 
 def build_experiment_list(dataset):
     dataset_size = len(dataset)
 
     return [
+   
+        {
+            "input_mode": "embeddings",
+            "feature_extractor": "dinov2",
+            "runner": "mlp",
+            "train": int(dataset_size * 0.7),
+            "val": int(dataset_size * 0.15),
+            "test": int(dataset_size * 0.15),
+            "lora": int(dataset_size * 0.15),
+            "augmentation": False
+        },
         {
             "input_mode": "images",
             "feature_extractor": "none",
@@ -16,21 +30,25 @@ def build_experiment_list(dataset):
             "test": int(dataset_size * 0.15),
             "lora": int(dataset_size * 0),
             "augmentation": False
-        },
-        {
-            "input_mode": "embeddings",
-            "feature_extractor": "dinov2_vitb14",
-            "runner": "mlp",
-            "train": int(dataset_size * 0.7),
-            "val": int(dataset_size * 0.15),
-            "test": int(dataset_size * 0.15),
-            "lora": int(dataset_size * 0.15),
-            "augmentation": False
         }
     ]
 
 
-def run_experiments(dataset, experiments, split_manager):
+def build_runner_registry():
+    return {
+        "mlp": MLPRunner(),
+        "centroid": CentroidRunner()
+    }
+
+
+def run_experiments(
+    dataset,
+    experiments,
+    split_manager,
+    feature_extractor
+):
+    runners = build_runner_registry()
+
     for experiment in experiments:
 
         split_bundle = split_manager.prepare_split(
@@ -38,10 +56,21 @@ def run_experiments(dataset, experiments, split_manager):
             experiment
         )
 
+        split_bundle = feature_extractor.transform_split_bundle(
+            split_bundle,
+            experiment["feature_extractor"]
+        )
+
+        runner = runners[
+            experiment["runner"]
+        ]
+
+        predictions = runner.run(
+            split_bundle
+        )
+
         print(
-            experiment["input_mode"],
-            experiment["runner"],
-            split_bundle.keys()
+            predictions
         )
 
 
@@ -49,6 +78,7 @@ def main():
     dataset_manager = DatasetManager()
     experiment_logger = ExperimentLogger()
     split_manager = SplitManager()
+    feature_extractor = FeatureExtractor()
 
     dataset = dataset_manager.load_dataset()
 
@@ -67,7 +97,8 @@ def main():
     run_experiments(
         dataset,
         experiments,
-        split_manager
+        split_manager,
+        feature_extractor
     )
 
 
