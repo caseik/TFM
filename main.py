@@ -14,11 +14,11 @@ def build_experiment_list(dataset):
         {
             "input_mode": "embeddings",
             "feature_extractor": "dinov2",
-            "runner": "mlp",
+            "runner": "centroid",
             "train": int(dataset_size * 0.7),
             "val": int(dataset_size * 0.15),
             "test": int(dataset_size * 0.15),
-            "lora": int(dataset_size * 0.15),
+            "lora": int(dataset_size * 0.0),
             "augmentation": False
         },
         {
