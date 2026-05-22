@@ -4,6 +4,7 @@ from split_manager import SplitManager
 from feature_extractor import FeatureExtractor
 from model_runners.mlp_runner import MLPRunner
 from model_runners.centroid_runner import CentroidRunner
+from model_runners.cnn_runner import CNNRunner
 from metrics_generator import MetricsGenerator
 
 
@@ -11,7 +12,7 @@ def build_experiment_list(dataset):
     dataset_size = len(dataset)
 
     return [
-   
+
         {
             "input_mode": "embeddings",
             "feature_extractor": "dinov2",
@@ -41,6 +42,24 @@ def build_experiment_list(dataset):
             "test": "rest", #int(dataset_size * 0.15),
             "lora": int(dataset_size * 0),
             "augmentation": False
+        },
+        {
+            "input_mode": "images",
+            "runner": "resnet50",
+            "epochs": 10,
+            "augmentation": True
+        },
+        {
+            "input_mode": "images",
+            "runner": "densenet121",
+            "epochs": 10,
+            "augmentation": True
+        },
+        {
+            "input_mode": "images",
+            "runner": "inceptionv3",
+            "epochs": 10,
+            "augmentation": True
         }
     ]
 
@@ -48,7 +67,10 @@ def build_experiment_list(dataset):
 def build_runner_registry():
     return {
         "mlp": MLPRunner(),
-        "centroid": CentroidRunner()
+        "centroid": CentroidRunner(),
+        "resnet50": CNNRunner(model_name="resnet50"),
+        "densenet121": CNNRunner(model_name="densenet121"),
+        "inceptionv3": CNNRunner(model_name="inceptionv3")
     }
 
 
@@ -68,10 +90,11 @@ def run_experiments(
             experiment
         )
 
-        split_bundle = feature_extractor.transform_split_bundle(
-            split_bundle,
-            experiment["feature_extractor"]
-        )
+        if experiment.get("input_mode") == "embeddings":
+            split_bundle = feature_extractor.transform_split_bundle(
+                split_bundle,
+                experiment["feature_extractor"]
+            )
 
         runner = runners[
             experiment["runner"]
