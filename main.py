@@ -4,6 +4,7 @@ from split_manager import SplitManager
 from feature_extractor import FeatureExtractor
 from model_runners.mlp_runner import MLPRunner
 from model_runners.centroid_runner import CentroidRunner
+from metrics_generator import MetricsGenerator
 
 
 def build_experiment_list(dataset):
@@ -15,19 +16,29 @@ def build_experiment_list(dataset):
             "input_mode": "embeddings",
             "feature_extractor": "dinov2",
             "runner": "centroid",
-            "train": int(dataset_size * 0.7),
-            "val": int(dataset_size * 0.15),
-            "test": int(dataset_size * 0.15),
+            "train": 50, #int(dataset_size * 0.7),
+            "val": int(dataset_size * 0.0),
+            "test": "rest", #int(dataset_size * 0.15),
             "lora": int(dataset_size * 0.0),
             "augmentation": False
         },
         {
-            "input_mode": "images",
-            "feature_extractor": "none",
-            "runner": "resnet50",
-            "train": int(dataset_size * 0.7),
+            "input_mode": "embeddings",
+            "feature_extractor": "dinov2",
+            "runner": "mlp",
+            "train": 50, #int(dataset_size * 0.1),
             "val": int(dataset_size * 0),
-            "test": int(dataset_size * 0.15),
+            "test": "rest", #int(dataset_size * 0.15),
+            "lora": int(dataset_size * 0),
+            "augmentation": False
+        },
+        {
+            "input_mode": "embeddings",
+            "feature_extractor": "dinov2",
+            "runner": "mlp",
+            "train": 70, #int(dataset_size * 0.1),
+            "val": int(dataset_size * 0),
+            "test": "rest", #int(dataset_size * 0.15),
             "lora": int(dataset_size * 0),
             "augmentation": False
         }
@@ -50,6 +61,7 @@ def run_experiments(
     runners = build_runner_registry()
 
     for experiment in experiments:
+        metrics_generator = MetricsGenerator()
 
         split_bundle = split_manager.prepare_split(
             dataset,
@@ -69,10 +81,18 @@ def run_experiments(
             split_bundle
         )
 
-        print(
+        metrics_generator.process_experiment(
+            experiment,
             predictions
         )
 
+        print(
+            metrics_generator.performance_rows
+        )
+
+        print(
+            metrics_generator.false_negative_rows
+        )
 
 def main():
     dataset_manager = DatasetManager()

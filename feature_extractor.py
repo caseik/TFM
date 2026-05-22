@@ -35,7 +35,8 @@ class FeatureExtractor:
 
             cache_key = self.build_cache_key(
                 split_name,
-                config
+                config,
+                split_df
             )
 
             cache_path = (
@@ -84,14 +85,17 @@ class FeatureExtractor:
             f"Unknown backbone: {config}"
         )
 
-    def build_cache_key(
-        self,
-        split_name,
-        config
-    ):
+    def build_cache_key(self, split_name, config, split_df):
+        image_paths = sorted(
+            split_df["image_path"].tolist()
+        )
+
         payload = {
             "split": split_name,
-            "backbone": config
+            "backbone": config,
+            "num_samples": len(split_df),
+            "images_hash": hashlib.md5(
+            json.dumps(image_paths).encode()).hexdigest()
         }
 
         signature = json.dumps(
@@ -99,9 +103,7 @@ class FeatureExtractor:
             sort_keys=True
         )
 
-        signature = hashlib.md5(
-            signature.encode()
-        ).hexdigest()
+        signature = hashlib.md5(signature.encode()).hexdigest()
 
         return (
             f"{config}_"

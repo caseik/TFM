@@ -48,7 +48,7 @@ class SplitManager:
                 remaining["dx"].unique()
             )
 
-            per_class = split_size // len(classes)
+            per_class = split_size
 
             for class_name in classes:
 

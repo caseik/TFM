@@ -1,3 +1,4 @@
 input_mode,runner,feature_extractor,train,val,test,lora,augmentation
-embeddings,centroid,dinov2,7010,1502,1502,0,False
-images,resnet50,none,7010,0,1502,0,False
+embeddings,centroid,dinov2,50,0,rest,0,False
+embeddings,mlp,dinov2,50,0,rest,0,False
+embeddings,mlp,dinov2,70,0,rest,0,False
