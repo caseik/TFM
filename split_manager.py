@@ -39,7 +39,7 @@ class SplitManager:
 
         for index, row in samples.iterrows():
 
-            image_path = row["path"]
+            image_path = row["image_path"]
 
             image = load_img(
                 image_path
@@ -71,7 +71,7 @@ class SplitManager:
 
             augmented_row = row.copy()
 
-            augmented_row["path"] = (augmented_path)
+            augmented_row["image_path"] = (augmented_path)
 
             augmented_rows.append(augmented_row)
 

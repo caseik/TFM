@@ -5,7 +5,7 @@ from feature_extractor import FeatureExtractor
 from model_runners.mlp_runner import MLPRunner
 from model_runners.centroid_runner import CentroidRunner
 from metrics_generator import MetricsGenerator
-
+from model_runners.resnet_runner import ResNet50Runner
 
 def build_experiment_list(dataset):
     dataset_size = len(dataset)
@@ -26,21 +26,21 @@ def build_experiment_list(dataset):
             "input_mode": "embeddings",
             "feature_extractor": "dinov2",
             "runner": "mlp",
-            "train": 50, #int(dataset_size * 0.1),
+            "train": 70, #int(dataset_size * 0.1),
             "val": int(dataset_size * 0),
             "test": "rest", #int(dataset_size * 0.15),
             "lora": int(dataset_size * 0),
             "augmentation": False
         },
         {
-            "input_mode": "embeddings",
-            "feature_extractor": "dinov2",
-            "runner": "mlp",
-            "train": 70, #int(dataset_size * 0.1),
-            "val": int(dataset_size * 0),
+            "input_mode": "image",
+            "feature_extractor": "none",
+            "runner": "resnet",
+            "train": 0.70, #int(dataset_size * 0.1),
+            "val": 0.0,
             "test": "rest", #int(dataset_size * 0.15),
-            "lora": int(dataset_size * 0),
-            "augmentation": False
+            "lora": 0.0,
+            "augmentation": True
         }
     ]
 
@@ -48,7 +48,8 @@ def build_experiment_list(dataset):
 def build_runner_registry():
     return {
         "mlp": MLPRunner(),
-        "centroid": CentroidRunner()
+        "centroid": CentroidRunner(),
+        "resnet": ResNet50Runner()
     }
 
 
@@ -68,11 +69,8 @@ def run_experiments(
             experiment
         )
 
-        split_bundle = feature_extractor.transform_split_bundle(
-            split_bundle,
-            experiment["feature_extractor"]
-        )
-
+        if experiment["input_mode"] == "embeddings":
+            split_bundle = feature_extractor.transform_split_bundle(split_bundle, experiment["feature_extractor"])
         runner = runners[
             experiment["runner"]
         ]
