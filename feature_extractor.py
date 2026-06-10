@@ -22,7 +22,7 @@ class FeatureExtractor:
         split_bundle,
         config
     ):
-        if config == "none":
+        if config in (None, "none"):
             return split_bundle
 
         extractor = self.load_backbone(
@@ -75,7 +75,7 @@ class FeatureExtractor:
 
     def load_backbone(self, config):
 
-        if config == "none":
+        if config in (None, "none"):
             return None
      
         if config == "dinov2":
