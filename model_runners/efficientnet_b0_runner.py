@@ -186,7 +186,7 @@ class EfficientNetB0Runner:
                 raise ValueError(f"Split '{split_name}' is empty")
 
     def get_class_order(self, *dataframes):
-        preferred_order = ["akiec", "bcc", "bkl", "df", "nv", "vasc", "mel"]
+        preferred_order = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
         present = set()
         for df in dataframes:
             present.update(df["dx"].dropna().unique().tolist())

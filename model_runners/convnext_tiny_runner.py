@@ -204,7 +204,7 @@ class ConvNeXtTinyRunner:
             raise ValueError("El split de test está vacío.")
 
     def prepare_label_mapping(self, split_bundle):
-        preferred_order = ["akiec", "bcc", "bkl", "df", "nv", "vasc", "mel"]
+        preferred_order = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
         present_classes = sorted(set(split_bundle["train"]["dx"]).union(set(split_bundle["test"]["dx"])))
 
         if set(present_classes).issubset(set(preferred_order)):

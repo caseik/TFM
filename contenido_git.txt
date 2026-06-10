@@ -1,0 +1,5672 @@
+==================================================
+FICHERO: ./backbones/dino_extractor.py
+==================================================
+from transformers import (
+    AutoImageProcessor,
+    AutoModel
+)
+
+from PIL import Image
+
+import torch
+
+
+class DinoExtractor:
+
+    def __init__(self):
+
+        self.model_name = (
+            "facebook/dinov2-small"
+        )
+
+        self.processor = (
+            AutoImageProcessor.from_pretrained(
+                self.model_name
+            )
+        )
+
+        self.model = (
+            AutoModel.from_pretrained(
+                self.model_name
+            )
+        )
+
+        self.device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+        self.model.to(
+            self.device
+        )
+
+        self.model.eval()
+
+    def encode(
+        self,
+        image_paths
+    ):
+        embeddings = []
+
+        with torch.no_grad():
+
+            for image_path in image_paths:
+
+                image = Image.open(
+                    image_path
+                ).convert(
+                    "RGB"
+                )
+
+                inputs = self.processor(
+                    images=image,
+                    return_tensors="pt"
+                )
+
+                inputs = {
+                    key: value.to(
+                        self.device
+                    )
+                    for key, value in inputs.items()
+                }
+
+                outputs = self.model(
+                    **inputs
+                )
+
+                embedding = (
+                    outputs.pooler_output
+                    .squeeze()
+                    .cpu()
+                    .numpy()
+                )
+
+                embeddings.append(
+                    embedding
+                )
+
+        return embeddings
+
+
+==================================================
+FICHERO: ./backbones/__init__.py
+==================================================
+
+
+
+==================================================
+FICHERO: ./config.py
+==================================================
+from dataclasses import dataclass
+from typing import Any
+
+CLASS_ORDER = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+
+SEEDS = [42, 1337, 2026]
+
+DEFAULT_SCENARIO = "few_shot_50"
+
+SCENARIOS: dict[str, dict[str, Any]] = {
+    # Cuenta aproximada por clase/lesión para train y val.
+    # El test queda fijo con el resto de lesiones no vistas.
+    "few_shot_50": {
+        "description": "Pocos datos: 50 lesiones por clase para entrenamiento y 10 para validación.",
+        "train": 50,
+        "val": 10,
+        "test": "rest",
+        "group_by": "lesion_id",
+    },
+    "few_shot_100": {
+        "description": "Pocos datos ampliado: 100 lesiones por clase para entrenamiento y 20 para validación.",
+        "train": 100,
+        "val": 20,
+        "test": "rest",
+        "group_by": "lesion_id",
+    },
+    "stratified_70_15_15": {
+        "description": "Partición estratificada clásica por lesión: 70 % train, 15 % val, 15 % test.",
+        "train": 0.70,
+        "val": 0.15,
+        "test": 0.15,
+        "group_by": "lesion_id",
+    },
+}
+
+EMBEDDING_EXPERIMENTS = [
+    {
+        "input_mode": "embeddings",
+        "feature_extractor": "dinov2",
+        "runner": "centroid",
+        "augmentation": False,
+    },
+    {
+        "input_mode": "embeddings",
+        "feature_extractor": "dinov2",
+        "runner": "mlp",
+        "augmentation": False,
+    },
+]
+
+IMAGE_EXPERIMENTS = [
+    {
+        "input_mode": "images",
+        "feature_extractor": "none",
+        "runner": "efficientnet_b0",
+        "augmentation": True,
+    },
+    {
+        "input_mode": "images",
+        "feature_extractor": "none",
+        "runner": "convnext_tiny",
+        "augmentation": True,
+    },
+    {
+        "input_mode": "images",
+        "feature_extractor": "none",
+        "runner": "mobilenet_v2",
+        "augmentation": True,
+    },
+    {
+        "input_mode": "images",
+        "feature_extractor": "none",
+        "runner": "vit_b16",
+        "augmentation": True,
+    },
+    {
+        "input_mode": "images",
+        "feature_extractor": "none",
+        "runner": "resnet50",
+        "augmentation": True,
+    },
+    {
+        "input_mode": "images",
+        "feature_extractor": "none",
+        "runner": "densenet121",
+        "augmentation": True,
+    },
+    {
+        "input_mode": "images",
+        "feature_extractor": "none",
+        "runner": "inception_v3",
+        "augmentation": True,
+    },
+]
+
+
+
+==================================================
+FICHERO: ./dataset_manager.py
+==================================================
+from pathlib import Path
+import pandas as pd
+import kagglehub
+
+
+class DatasetManager:
+
+    LABELS = {
+        "akiec": "Actinic keratoses",
+        "bcc": "Basal cell carcinoma",
+        "bkl": "Benign keratosis",
+        "df": "Dermatofibroma",
+        "mel": "Melanoma",
+        "nv": "Nevus",
+        "vasc": "Vascular lesion"
+    }
+
+    def __init__(self):
+        self.dataset_dir = None
+
+    def load_dataset(self):
+
+        self.ensure_dataset_available()
+
+        df = self.load_metadata()
+
+        df = self.resolve_image_paths(df)
+
+        self.validate_dataset(df)
+
+        df = self.enrich_metadata(df)
+
+        return df
+
+    def ensure_dataset_available(self):
+        """
+        Descarga el dataset (si no existe) y devuelve el path local.
+        KaggleHub gestiona automáticamente el cache.
+        """
+
+        self.dataset_dir = Path(
+            kagglehub.dataset_download(
+                "kmader/skin-cancer-mnist-ham10000"
+            )
+        )
+
+    def load_metadata(self):
+
+        metadata_path = (
+            self.dataset_dir / "HAM10000_metadata.csv"
+        )
+
+        return pd.read_csv(metadata_path)
+
+    def resolve_image_paths(self, df):
+
+        image_paths = {}
+
+        for image_file in self.dataset_dir.rglob("*.jpg"):
+
+            image_paths[
+                image_file.stem
+            ] = str(image_file)
+
+        df["image_path"] = df["image_id"].map(
+            image_paths
+        )
+
+        return df
+
+    def validate_dataset(self, df):
+
+        if df["image_path"].isna().any():
+            raise ValueError("Faltan imágenes.")
+
+        if df["image_id"].duplicated().any():
+            raise ValueError("Hay image_id duplicados.")
+
+    def enrich_metadata(self, df):
+
+        # Labels legibles
+        df["readable_label"] = df["dx"].map(
+            self.LABELS
+        )
+
+        # Índices numéricos
+        classes = sorted(df["dx"].unique())
+
+        class_to_idx = {
+            label: idx
+            for idx, label in enumerate(classes)
+        }
+
+        df["class_idx"] = df["dx"].map(
+            class_to_idx
+        )
+
+        # Seleccionar solo columnas útiles
+        df = df[
+            [
+                "lesion_id",
+                "image_id",
+                "dx",
+                "image_path",
+                "readable_label",
+                "class_idx"
+            ]
+        ]
+
+        return df
+
+
+==================================================
+FICHERO: ./experiment_logger.py
+==================================================
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+
+@dataclass
+class ExperimentRecord:
+    experiment_id: str
+    scenario: str
+    seed: int
+    input_mode: str
+    runner: str
+    feature_extractor: str
+    train: int | float
+    val: int | float
+    test: int | float | str
+    group_by: str
+    augmentation: bool
+
+
+class ExperimentLogger:
+    """
+    Genera la tabla de planificación experimental del TFM.
+
+    A diferencia de la versión inicial, no depende de campos obsoletos como `lora`
+    y registra todos los modelos definidos en main.py.
+    """
+
+    def __init__(self):
+        self._records: list[ExperimentRecord] = []
+
+    def register_batch(self, experiments: list[dict[str, Any]]) -> None:
+        for experiment in experiments:
+            record = ExperimentRecord(
+                experiment_id=experiment["experiment_id"],
+                scenario=experiment["scenario"],
+                seed=int(experiment["seed"]),
+                input_mode=experiment["input_mode"],
+                runner=experiment["runner"],
+                feature_extractor=str(experiment.get("feature_extractor", "none")),
+                train=experiment["train"],
+                val=experiment["val"],
+                test=experiment["test"],
+                group_by=experiment.get("group_by", "lesion_id"),
+                augmentation=bool(experiment.get("augmentation", False)),
+            )
+            self._records.append(record)
+
+    def format_records(self) -> list[dict[str, Any]]:
+        return [asdict(record) for record in self._records]
+
+    def export_table(self, path: str | Path) -> pd.DataFrame:
+        table = pd.DataFrame(self.format_records())
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(path, index=False)
+        return table
+
+
+
+==================================================
+FICHERO: ./feature_extractor.py
+==================================================
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+from backbones.dino_extractor import (
+    DinoExtractor
+)
+
+
+class FeatureExtractor:
+
+    def __init__(self, cache_dir="cache"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+    def transform_split_bundle(
+        self,
+        split_bundle,
+        config
+    ):
+        if config in (None, "none"):
+            return split_bundle
+
+        extractor = self.load_backbone(
+            config
+        )
+
+        transformed = {}
+
+        for split_name, split_df in split_bundle.items():
+
+            cache_key = self.build_cache_key(
+                split_name,
+                config,
+                split_df
+            )
+
+            cache_path = (
+                self.cache_dir /
+                f"{cache_key}.npz"
+            )
+
+            if cache_path.exists():
+
+                embeddings = self.load_embeddings(
+                    cache_path
+                )
+
+            else:
+
+                embeddings = extractor.encode(
+                    split_df["image_path"].tolist()
+                )
+
+                self.save_embeddings(
+                    cache_path,
+                    embeddings
+                )
+
+            split_copy = split_df.copy()
+
+            split_copy["embedding"] = list(
+                embeddings
+            )
+
+            transformed[
+                split_name
+            ] = split_copy
+
+        return transformed
+
+    def load_backbone(self, config):
+
+        if config in (None, "none"):
+            return None
+     
+        if config == "dinov2":
+            return DinoExtractor()
+
+        raise ValueError(
+            f"Unknown backbone: {config}"
+        )
+
+    def build_cache_key(self, split_name, config, split_df):
+        image_paths = sorted(
+            split_df["image_path"].tolist()
+        )
+
+        payload = {
+            "split": split_name,
+            "backbone": config,
+            "num_samples": len(split_df),
+            "images_hash": hashlib.md5(
+            json.dumps(image_paths).encode()).hexdigest()
+        }
+
+        signature = json.dumps(
+            payload,
+            sort_keys=True
+        )
+
+        signature = hashlib.md5(signature.encode()).hexdigest()
+
+        return (
+            f"{config}_"
+            f"{split_name}_"
+            f"{signature}"
+        )
+
+    def save_embeddings(
+        self,
+        path,
+        embeddings
+    ):
+        np.savez(
+            path,
+            embeddings=embeddings
+        )
+
+    def load_embeddings(
+        self,
+        path
+    ):
+        data = np.load(
+            path,
+            allow_pickle=True
+        )
+
+        return data[
+            "embeddings"
+        ]
+
+
+==================================================
+FICHERO: ./llm/modules/dataset_manager.md
+==================================================
+main.py
+   |
+   v
+dataset_manager.load_dataset()
+   |
+   +--> 1. ensure_dataset_available()
+   |         - delega en KaggleHub la gestión del dataset
+   |         - KaggleHub comprueba cache local (~/.cache)
+   |         - si no existe, descarga automáticamente HAM10000
+   |
+   +--> 2. load_metadata()
+   |         - carga HAM10000_metadata.csv
+   |
+   +--> 3. resolve_image_paths()
+   |         - asocia cada image_id con su jpg
+   |
+   +--> 4. validate_dataset()
+   |         - comprueba imágenes faltantes
+   |         - comprueba duplicados/inconsistencias
+   |
+   +--> 5. enrich_metadata()
+   |         - añade readable_label
+   |         - añade class_idx
+   |         - elimina columnas clínicas no utilizadas (age, sex, location, dx_type)
+   |
+   +--> 6. return DataFrame
+             listo para split_manager
+
+
+==================================================
+FICHERO: ./llm/modules/experiment_logger.md
+==================================================
+experiment_logger
+   |
+   +--> 1. register_batch(experiments)
+   |         - receives list of experiment dictionaries
+   |         - stores selected experimental parameters
+   |         - keeps records in memory
+   |
+   +--> 2. format_records()
+   |         - extracts relevant fields
+   |         - organizes rows for publication table
+   |
+   +--> 3. export_table(path)
+             - generates Table 1
+             - returns or saves formatted table
+
+
+==================================================
+FICHERO: ./llm/modules/feature_extractor.md
+==================================================
+feature_extractor
+   |
+   +--> 1. load_backbone(config)
+   |         - loads embedding model (DINOv2, CLIP, ...)
+   |         - prepares preprocessing pipeline
+   |         - returns inference-ready extractor
+   |
+   +--> 2. build_cache_key(split, config)
+   |         - builds unique embedding signature
+   |         - includes backbone + preprocessing + split identity
+   |         - returns cache identifier
+   |
+   +--> 3. transform_split_bundle(split_bundle)
+   |         - iterates over all splits
+   |         - checks cache before inference
+   |         - computes missing embeddings only
+   |
+   +--> 4. save_embeddings(...)
+   |         - persists computed embeddings
+   |         - stores metadata alignment
+   |
+   +--> 5. load_embeddings(...)
+             - restores cached embeddings
+             - reconstructs split outputs
+
+
+==================================================
+FICHERO: ./llm/modules/main.md
+==================================================
+main.py
+   |
+   +--> 1. dataset_manager.load_dataset()
+   |         - loads HAM10000 metadata + image paths
+   |         - validates and enriches dataset metadata
+   |
+   +--> 2. build_experiment_list()
+   |         - defines all planned experiments
+   |         - each experiment is represented as a Python dict
+   |
+   +--> 3. experiment_logger.register_batch()
+   |         - registers the full experimental plan
+   |
+   +--> 4. experiment_logger.export_table()
+   |         - generates Table 1 before execution
+   |
+   +--> 5. run_experiments()
+             |
+             +--> iterates over experiments
+             |
+             +--> split_manager.prepare_split()
+             |         - creates experiment-specific splits
+             |         - applies balanced sampling
+             |         - applies optional augmentation
+             |
+             +--> dispatch to model runner
+NOT COMPLETE
+
+
+==================================================
+FICHERO: ./llm/modules/metrics_generator.md
+==================================================
+metrics_generator
+   |
+   +--> 1. process_experiment(experiment_config, predictions)
+   |         - receives one experiment configuration and model predictions
+   |         - validates prediction structure and label consistency
+   |         - initializes metric computation pipeline
+   |
+   +--> 2. build_confusion_statistics()
+   |         - computes per-class TP, FP, FN, and support counts
+   |         - derives global prediction statistics
+   |         - constructs class-level statistical summaries
+   |
+   +--> 3. compute_metrics()
+   |         - computes global accuracy
+   |         - computes per-class sensitivity (recall)
+   |         - computes false negative rates
+   |         - associates all metrics with class support sizes
+   |
+   +--> 4. estimate_confidence_intervals()
+   |         - computes 95% confidence intervals for all proportion metrics
+   |         - adjusts interval width according to sample size
+   |         - supports statistically robust interval estimation methods
+   |
+   +--> 5. build_result_tables()
+             - formats experiment metrics into publication-ready rows
+             - generates classification performance summaries
+             - generates clinical false negative summaries
+
+
+| Model | Global Acc. | 95% CI | MEL Sens. | MEL CI | MEL n | NV Sens. | NV CI | NV n | ... |
+|-------|--------------|---------|------------|---------|-------|-----------|--------|------|-----|
+| MLP   | 81.0%        | 79–83   | 74.0%      | 69–78   | 420   | 89.0%     | 88–90  | 3800 | ... |
+
+
+| Model | MEL FN | MEL FN Rate | MEL CI | MEL n | BCC FN | BCC FN Rate | BCC CI | ... |
+|-------|---------|--------------|---------|-------|---------|---------------|---------|-----|
+| MLP   | 122     | 29.0%        | 25–34   | 420   | ...     | ...           | ...     | ... |
+
+
+==================================================
+FICHERO: ./llm/modules/model_runner.md
+==================================================
+model runners
+   |
+   +--> MLPRunner.run(split_bundle)
+   |         - validate embedding inputs
+   |         - prepare tensors
+   |         - train MLP
+   |         - run inference
+   |         - package predictions
+   |
+   +--> CentroidRunner.run(split_bundle)
+   |         - validate embedding inputs
+   |         - compute class centroids
+   |         - compute distances
+   |         - assign predictions
+   |         - package predictions
+   |
+   +--> ResNetRunner.run(split_bundle)
+             - validate image inputs
+             - create dataloaders
+             - train CNN
+             - run inference
+             - package predictions
+
+
+==================================================
+FICHERO: ./llm/modules/split_manager.md
+==================================================
+split_manager
+   |
+   +--> 1. prepare_split(dataset, experiment_config)
+   |         - receives the full dataset and one experiment dictionary
+   |         - initializes deterministic random sampling using a fixed seed
+   |         - interprets split directives (train, val, test, lora)
+   |         - supports fixed counts, zero allocation, and remainder allocation
+   |
+   +--> 2. select_subsets()
+   |         - performs balanced sampling across classes
+   |         - randomly selects samples per class
+   |         - guarantees reproducibility across runs
+   |
+   +--> 3. apply_augmentation()
+   |         - checks augmentation flag in experiment configuration
+   |         - applies the project-wide augmentation protocol to training samples
+   |         - leaves validation and test subsets unchanged
+   |
+   +--> 4. build_split_bundle()
+             - packages all generated subsets
+             - returns runner-ready data partitions
+             - includes train, val, test, and optional lora subsets
+
+
+==================================================
+FICHERO: ./llm/system.md
+==================================================
+                         +----------------------+
+                         |       main.py        |
+                         |  Global orchestrator |
+                         +----------+-----------+
+                                    |
+                                    v
+                    +---------------+----------------+
+                    |                                |
+                    v                                v
+        +----------------------+       +----------------------+
+        |   dataset_manager    |       |  experiment_logger   |
+        |----------------------|       |----------------------|
+        | - download/cache     |       | Table 1 (exp. plan)  |
+        | - load HAM10000      |       | experimental config  |
+        +----------+-----------+       +----------------------+
+                   |
+                   v
+        +----------------------+
+        |    split_manager     |
+        |----------------------|
+        | - create_splits()    |
+        +----------+-----------+
+                   |
+                   v
+        +----------------------+
+        |  feature_extractor   |
+        |----------------------|
+        | - optional stage     |
+        | - image -> embedding |
+        | - skipped if none    |
+        +----------+-----------+
+                   |
+                   v
+      +------------+--------------------------------------+
+      |                model runners                      |
+      |---------------------------------------------------|
+      | mlp_runner.py                                     |
+      | centroid_runner.py                                |
+      | resnet_runner.py                                  |
+      | lora_runner.py                                    |
+      +----------------------+----------------------------+
+                             |
+                             v
+                +------------+----------------+
+                |    metrics_generator        |
+                |-----------------------------|
+                | Table 2 (accuracy/classes) |
+                | Table 3 (clinical FN)      |
+                +-----------------------------+
+
+
+main.py is responsible for constructing the full experimental plan after dataset loading and split generation. Each experiment specification is registered through the logger before execution, allowing Table 1 to be generated prior to model training.
+
+
+==================================================
+FICHERO: ./main.py
+==================================================
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any
+
+from config import (
+    CLASS_ORDER,
+    DEFAULT_SCENARIO,
+    EMBEDDING_EXPERIMENTS,
+    IMAGE_EXPERIMENTS,
+    SCENARIOS,
+    SEEDS,
+)
+from dataset_manager import DatasetManager
+from experiment_logger import ExperimentLogger
+from feature_extractor import FeatureExtractor
+from metrics_generator import MetricsGenerator
+from split_manager import SplitManager
+
+from model_runners.centroid_runner import CentroidRunner
+from model_runners.convnext_tiny_runner import ConvNeXtTinyRunner
+from model_runners.densenet121_runner import DenseNet121Runner
+from model_runners.efficientnet_b0_runner import EfficientNetB0Runner
+from model_runners.inception_v3_runner import InceptionV3Runner
+from model_runners.mlp_runner import MLPRunner
+from model_runners.mobilenet_v2_runner import MobileNetV2Runner
+from model_runners.resnet50_runner import ResNet50Runner
+from model_runners.vit_b16_runner import ViTB16Runner
+
+
+def build_runner_registry(seed: int = 42) -> dict[str, Any]:
+    """
+    Registro único de modelos.
+
+    Se mantiene la batería amplia de contenido_ismael y se elimina el runner genérico
+    antiguo para que cada arquitectura tenga nombre propio en tablas y resultados.
+    """
+    return {
+        "centroid": CentroidRunner(),
+        "mlp": MLPRunner(),
+        "efficientnet_b0": EfficientNetB0Runner(seed=seed),
+        "convnext_tiny": ConvNeXtTinyRunner(seed=seed),
+        "mobilenet_v2": MobileNetV2Runner(seed=seed),
+        "vit_b16": ViTB16Runner(seed=seed),
+        "resnet50": ResNet50Runner(seed=seed),
+        "densenet121": DenseNet121Runner(seed=seed),
+        "inception_v3": InceptionV3Runner(seed=seed),
+    }
+
+
+def build_experiment_list(
+    scenario_name: str,
+    seeds: list[int],
+    only_embeddings: bool = False,
+    only_images: bool = False,
+) -> list[dict[str, Any]]:
+    if scenario_name not in SCENARIOS:
+        raise ValueError(
+            f"Escenario desconocido '{scenario_name}'. Disponibles: {list(SCENARIOS)}"
+        )
+
+    scenario = SCENARIOS[scenario_name]
+
+    base_experiments: list[dict[str, Any]] = []
+    if not only_images:
+        base_experiments.extend(EMBEDDING_EXPERIMENTS)
+    if not only_embeddings:
+        base_experiments.extend(IMAGE_EXPERIMENTS)
+
+    experiments = []
+
+    for seed in seeds:
+        for base in base_experiments:
+            experiment = {
+                **base,
+                "scenario": scenario_name,
+                "scenario_description": scenario["description"],
+                "seed": seed,
+                "train": scenario["train"],
+                "val": scenario["val"],
+                "test": scenario["test"],
+                "group_by": scenario["group_by"],
+            }
+            experiment["experiment_id"] = (
+                f"{scenario_name}_seed_{seed}_"
+                f"{experiment['feature_extractor']}_{experiment['runner']}"
+            )
+            experiments.append(experiment)
+
+    return experiments
+
+
+def run_experiments(
+    dataset,
+    experiments: list[dict[str, Any]],
+    results_dir: str | Path = "results",
+) -> None:
+    results_dir = Path(results_dir)
+    metrics_generator = MetricsGenerator(
+        class_order=CLASS_ORDER,
+        output_dir=results_dir,
+    )
+    feature_extractor = FeatureExtractor(cache_dir=results_dir / "cache")
+
+    for experiment in experiments:
+        print("\n" + "=" * 80)
+        print(f"Ejecutando experimento: {experiment['experiment_id']}")
+        print("=" * 80)
+
+        seed = int(experiment["seed"])
+
+        split_manager = SplitManager(
+            seed=seed,
+            split_dir=results_dir / "splits",
+            export_splits=True,
+        )
+        split_bundle = split_manager.prepare_split(dataset, experiment)
+
+        if experiment["input_mode"] == "embeddings":
+            split_bundle = feature_extractor.transform_split_bundle(
+                split_bundle,
+                experiment["feature_extractor"],
+            )
+
+        runners = build_runner_registry(seed=seed)
+        runner = runners[experiment["runner"]]
+
+        predictions = runner.run(split_bundle)
+
+        metrics_generator.process_experiment(
+            experiment,
+            predictions,
+        )
+
+        metrics_generator.export_tables()
+
+    performance, false_negatives = metrics_generator.export_tables()
+
+    print("\nTablas generadas:")
+    print(results_dir / "table_2_performance.csv")
+    print(results_dir / "table_3_false_negatives.csv")
+    print("\nResumen de rendimiento:")
+    print(performance[["Experiment ID", "Accuracy", "Balanced Accuracy", "Macro F1"]])
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Comparativa definitiva HAM10000: fine-tuning frente a embeddings."
+    )
+    parser.add_argument(
+        "--scenario",
+        default=DEFAULT_SCENARIO,
+        choices=list(SCENARIOS.keys()),
+        help="Escenario experimental.",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=SEEDS,
+        help="Semillas para repetir experimentos.",
+    )
+    parser.add_argument(
+        "--only-embeddings",
+        action="store_true",
+        help="Ejecuta solo DINOv2 + centroides/MLP.",
+    )
+    parser.add_argument(
+        "--only-images",
+        action="store_true",
+        help="Ejecuta solo modelos de imagen con fine-tuning.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        default="results",
+        help="Directorio de salida para tablas, splits, caché y matrices.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    dataset_manager = DatasetManager()
+    experiment_logger = ExperimentLogger()
+
+    dataset = dataset_manager.load_dataset()
+
+    experiments = build_experiment_list(
+        scenario_name=args.scenario,
+        seeds=args.seeds,
+        only_embeddings=args.only_embeddings,
+        only_images=args.only_images,
+    )
+
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    experiment_logger.register_batch(experiments)
+    experiment_logger.export_table(results_dir / "table_1_experimental_plan.csv")
+
+    run_experiments(
+        dataset=dataset,
+        experiments=experiments,
+        results_dir=results_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+==================================================
+FICHERO: ./metrics_generator.py
+==================================================
+from __future__ import annotations
+
+from pathlib import Path
+from statistics import NormalDist
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_fscore_support,
+)
+
+
+class MetricsGenerator:
+    """
+    Métricas orientadas a una comparativa médica en HAM10000.
+
+    Incluye:
+    - accuracy global,
+    - balanced accuracy,
+    - macro F1,
+    - weighted F1,
+    - sensibilidad/recall por clase,
+    - precisión por clase,
+    - F1 por clase,
+    - falsos negativos por clase,
+    - intervalos de confianza Wilson para proporciones,
+    - matriz de confusión exportable.
+
+    La métrica clínica prioritaria para el paper debe ser la sensibilidad de melanoma
+    y la tasa de falsos negativos de melanoma, no solo la accuracy global.
+    """
+
+    def __init__(
+        self,
+        class_order: list[str] | None = None,
+        output_dir: str | Path = "results",
+    ):
+        self.class_order = class_order or ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+        self.output_dir = Path(output_dir)
+        self.performance_rows: list[dict[str, Any]] = []
+        self.false_negative_rows: list[dict[str, Any]] = []
+
+    def process_experiment(self, experiment_config: dict[str, Any], predictions: dict[str, list[int]]) -> None:
+        self.validate_predictions(predictions)
+
+        y_true = np.asarray(predictions["y_true"], dtype=int)
+        y_pred = np.asarray(predictions["y_pred"], dtype=int)
+
+        labels = list(range(len(self.class_order)))
+
+        global_metrics = self.compute_global_metrics(y_true, y_pred, labels)
+        per_class_metrics = self.compute_per_class_metrics(y_true, y_pred, labels)
+
+        self.build_result_tables(experiment_config, global_metrics, per_class_metrics)
+        self.export_confusion_matrix(experiment_config, y_true, y_pred, labels)
+
+    def validate_predictions(self, predictions: dict[str, list[int]]) -> None:
+        required_keys = {"y_true", "y_pred"}
+        if not required_keys.issubset(predictions):
+            raise ValueError("Invalid prediction structure. Expected y_true and y_pred.")
+
+        if len(predictions["y_true"]) != len(predictions["y_pred"]):
+            raise ValueError("Prediction size mismatch.")
+
+        if len(predictions["y_true"]) == 0:
+            raise ValueError("Empty prediction arrays.")
+
+    def compute_global_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, labels: list[int]) -> dict[str, Any]:
+        accuracy = accuracy_score(y_true, y_pred)
+        balanced_accuracy = balanced_accuracy_score(y_true, y_pred)
+        macro_f1 = f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+        weighted_f1 = f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+
+        return {
+            "accuracy": accuracy,
+            "accuracy_ci": self.wilson_ci(int((y_true == y_pred).sum()), len(y_true)),
+            "balanced_accuracy": balanced_accuracy,
+            "macro_f1": macro_f1,
+            "weighted_f1": weighted_f1,
+            "n": len(y_true),
+        }
+
+    def compute_per_class_metrics(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        labels: list[int],
+    ) -> dict[str, dict[str, Any]]:
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            labels=labels,
+            zero_division=0,
+        )
+
+        metrics: dict[str, dict[str, Any]] = {}
+
+        for idx, class_name in enumerate(self.class_order):
+            class_id = labels[idx]
+            class_support = int(support[idx])
+            tp = int(((y_true == class_id) & (y_pred == class_id)).sum())
+            fn = int(((y_true == class_id) & (y_pred != class_id)).sum())
+
+            metrics[class_name] = {
+                "precision": float(precision[idx]),
+                "recall": float(recall[idx]),
+                "f1": float(f1[idx]),
+                "support": class_support,
+                "tp": tp,
+                "fn": fn,
+                "fn_rate": float(fn / class_support) if class_support else 0.0,
+                "recall_ci": self.wilson_ci(tp, class_support),
+                "fn_rate_ci": self.wilson_ci(fn, class_support),
+            }
+
+        return metrics
+
+    def wilson_ci(self, successes: int, n: int, confidence: float = 0.95) -> tuple[float, float]:
+        if n == 0:
+            return (0.0, 0.0)
+
+        z = NormalDist().inv_cdf(1 - (1 - confidence) / 2)
+        p = successes / n
+        denominator = 1 + z**2 / n
+        centre = p + z**2 / (2 * n)
+        margin = z * np.sqrt((p * (1 - p) + z**2 / (4 * n)) / n)
+
+        lower = (centre - margin) / denominator
+        upper = (centre + margin) / denominator
+
+        return (max(0.0, float(lower)), min(1.0, float(upper)))
+
+    def build_result_tables(
+        self,
+        experiment_config: dict[str, Any],
+        global_metrics: dict[str, Any],
+        per_class_metrics: dict[str, dict[str, Any]],
+    ) -> None:
+        base = self.base_experiment_fields(experiment_config)
+
+        performance_row = {
+            **base,
+            "Accuracy": self.format_percentage(global_metrics["accuracy"]),
+            "Accuracy 95% CI": self.format_ci(global_metrics["accuracy_ci"]),
+            "Balanced Accuracy": self.format_percentage(global_metrics["balanced_accuracy"]),
+            "Macro F1": self.format_percentage(global_metrics["macro_f1"]),
+            "Weighted F1": self.format_percentage(global_metrics["weighted_f1"]),
+            "N test": global_metrics["n"],
+        }
+
+        fn_row = {
+            **base,
+            "N test": global_metrics["n"],
+        }
+
+        for class_name, class_metrics in per_class_metrics.items():
+            performance_row[f"{class_name} Recall"] = self.format_percentage(class_metrics["recall"])
+            performance_row[f"{class_name} Recall 95% CI"] = self.format_ci(class_metrics["recall_ci"])
+            performance_row[f"{class_name} Precision"] = self.format_percentage(class_metrics["precision"])
+            performance_row[f"{class_name} F1"] = self.format_percentage(class_metrics["f1"])
+            performance_row[f"{class_name} n"] = class_metrics["support"]
+
+            fn_row[f"{class_name} FN"] = class_metrics["fn"]
+            fn_row[f"{class_name} FN Rate"] = self.format_percentage(class_metrics["fn_rate"])
+            fn_row[f"{class_name} FN Rate 95% CI"] = self.format_ci(class_metrics["fn_rate_ci"])
+            fn_row[f"{class_name} n"] = class_metrics["support"]
+
+        self.performance_rows.append(performance_row)
+        self.false_negative_rows.append(fn_row)
+
+    def base_experiment_fields(self, experiment_config: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "Experiment ID": experiment_config.get("experiment_id"),
+            "Scenario": experiment_config.get("scenario"),
+            "Seed": experiment_config.get("seed"),
+            "Input mode": experiment_config.get("input_mode"),
+            "Feature extractor": experiment_config.get("feature_extractor", "none"),
+            "Model": experiment_config.get("runner"),
+        }
+
+    def export_confusion_matrix(
+        self,
+        experiment_config: dict[str, Any],
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        labels: list[int],
+    ) -> None:
+        experiment_id = experiment_config.get("experiment_id", "experiment")
+        matrix = confusion_matrix(y_true, y_pred, labels=labels)
+        matrix_df = pd.DataFrame(
+            matrix,
+            index=[f"true_{c}" for c in self.class_order],
+            columns=[f"pred_{c}" for c in self.class_order],
+        )
+
+        matrix_dir = self.output_dir / "confusion_matrices"
+        matrix_dir.mkdir(parents=True, exist_ok=True)
+        matrix_df.to_csv(matrix_dir / f"{experiment_id}.csv")
+
+    def export_tables(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        performance = pd.DataFrame(self.performance_rows)
+        false_negatives = pd.DataFrame(self.false_negative_rows)
+
+        performance.to_csv(self.output_dir / "table_2_performance.csv", index=False)
+        false_negatives.to_csv(self.output_dir / "table_3_false_negatives.csv", index=False)
+
+        return performance, false_negatives
+
+    def format_percentage(self, value: float) -> str:
+        return f"{value * 100:.1f}%"
+
+    def format_ci(self, ci: tuple[float, float]) -> str:
+        lower, upper = ci
+        return f"{lower * 100:.1f}–{upper * 100:.1f}"
+
+
+
+==================================================
+FICHERO: ./model_runners/centroid_runner.py
+==================================================
+import torch
+
+
+class CentroidRunner:
+
+    def run(self, split_bundle):
+        self.validate_inputs(split_bundle)
+
+        x_train, y_train = self.prepare_split(
+            split_bundle["train"]
+        )
+
+        x_test, y_test = self.prepare_split(
+            split_bundle["test"]
+        )
+
+        centroids = self.compute_centroids(
+            x_train,
+            y_train
+        )
+
+        predictions = self.predict(
+            x_test,
+            centroids
+        )
+
+        return self.package_predictions(
+            y_test,
+            predictions
+        )
+
+    def validate_inputs(self, split_bundle):
+        if "embedding" not in split_bundle["train"]:
+            raise ValueError("Embeddings required")
+
+    def prepare_split(self, split):
+        x = torch.tensor(
+            split["embedding"].tolist(),
+            dtype=torch.float32
+        )
+
+        classes = sorted(
+            split["dx"].unique()
+        )
+
+        mapping = {
+            label: idx
+            for idx, label in enumerate(classes)
+        }
+
+        y = torch.tensor(
+            split["dx"].map(mapping).tolist(),
+            dtype=torch.long
+        )
+
+        return x, y
+
+    def compute_centroids(self, x, y):
+        centroids = []
+
+        for class_id in y.unique():
+            class_vectors = x[
+                y == class_id
+            ]
+
+            centroids.append(
+                class_vectors.mean(dim=0)
+            )
+
+        return torch.stack(
+            centroids
+        )
+
+    def predict(self, x, centroids):
+        distances = torch.cdist(
+            x,
+            centroids
+        )
+
+        return distances.argmin(
+            dim=1
+        )
+
+    def package_predictions(self, y_true, y_pred):
+        return {
+            "y_true": y_true.tolist(),
+            "y_pred": y_pred.tolist()
+        }
+
+
+==================================================
+FICHERO: ./model_runners/convnext_tiny_runner.py
+==================================================
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+from sklearn.utils.class_weight import compute_class_weight
+from torch.optim import AdamW
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import models, transforms
+
+
+class HAM10000ImageDataset(Dataset):
+    """Dataset compatible con los DataFrame generados por SplitManager.
+
+    Espera columnas:
+    - path: ruta de imagen JPG
+    - dx: etiqueta textual original de HAM10000
+
+    También acepta image_path como alternativa a path.
+    """
+
+    def __init__(self, dataframe, class_to_idx, transform=None):
+        self.df = dataframe.reset_index(drop=True).copy()
+        self.class_to_idx = class_to_idx
+        self.transform = transform
+
+        if "path" not in self.df.columns and "image_path" in self.df.columns:
+            self.df["path"] = self.df["image_path"]
+
+        if "path" not in self.df.columns:
+            raise ValueError("ConvNeXtTinyRunner necesita una columna 'path' o 'image_path'.")
+
+        if "dx" not in self.df.columns:
+            raise ValueError("ConvNeXtTinyRunner necesita una columna 'dx' con la clase.")
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        image = Image.open(row["path"]).convert("RGB")
+        label = self.class_to_idx[row["dx"]]
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image, torch.tensor(label, dtype=torch.long)
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(reduction="none")
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+        pt = torch.exp(-ce_loss)
+        focal = (1 - pt) ** self.gamma * ce_loss
+
+        if self.alpha is not None:
+            focal = self.alpha[targets] * focal
+
+        if self.reduction == "mean":
+            return focal.mean()
+        if self.reduction == "sum":
+            return focal.sum()
+        return focal
+
+
+class ConvNeXtTinyRunner:
+    """Runner end-to-end para ConvNeXt-Tiny.
+
+    Encaja con la interfaz común del proyecto:
+        predictions = runner.run(split_bundle)
+
+    Devuelve:
+        {"y_true": [...], "y_pred": [...]}
+
+    Diferencia metodológica:
+    - No consume embeddings.
+    - Consume imágenes directamente desde la columna path.
+    - Hace fine-tuning supervisado end-to-end.
+    """
+
+    def __init__(
+        self,
+        img_size=224,
+        batch_size=16,
+        epochs=12,
+        learning_rate=1e-4,
+        weight_decay=1e-4,
+        gamma=2.0,
+        num_workers=2,
+        seed=42,
+        checkpoint_path="best_convnext_tiny_ham10000.pth",
+        use_weighted_sampler=True,
+        pretrained=True,
+    ):
+        self.img_size = img_size
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.gamma = gamma
+        self.num_workers = num_workers
+        self.seed = seed
+        self.checkpoint_path = checkpoint_path
+        self.use_weighted_sampler = use_weighted_sampler
+        self.pretrained = pretrained
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.class_order = None
+        self.class_to_idx = None
+        self.idx_to_class = None
+
+        self.set_seed(self.seed)
+
+    def run(self, split_bundle):
+        self.validate_inputs(split_bundle)
+        self.prepare_label_mapping(split_bundle)
+
+        train_loader, val_loader, test_loader, class_weights = self.build_dataloaders(split_bundle)
+        model = self.build_model(num_classes=len(self.class_order))
+        criterion = FocalLoss(alpha=class_weights, gamma=self.gamma)
+        optimizer = AdamW(model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=2,
+        )
+
+        best_macro_f1 = -1.0
+        best_state = None
+
+        for epoch in range(1, self.epochs + 1):
+            print(f"\n===== ConvNeXt-Tiny | Epoch {epoch}/{self.epochs} =====")
+
+            train_metrics, _, _ = self.run_one_epoch(
+                model=model,
+                loader=train_loader,
+                criterion=criterion,
+                optimizer=optimizer,
+                train=True,
+            )
+
+            if val_loader is not None:
+                val_metrics, _, _ = self.run_one_epoch(
+                    model=model,
+                    loader=val_loader,
+                    criterion=criterion,
+                    optimizer=None,
+                    train=False,
+                )
+                monitor_value = val_metrics["macro_f1"]
+                scheduler.step(monitor_value)
+            else:
+                val_metrics = None
+                monitor_value = train_metrics["macro_f1"]
+
+            self.print_epoch_metrics(train_metrics, val_metrics)
+
+            if monitor_value > best_macro_f1:
+                best_macro_f1 = monitor_value
+                best_state = {
+                    "model_state_dict": model.state_dict(),
+                    "best_macro_f1": best_macro_f1,
+                    "class_order": self.class_order,
+                    "img_size": self.img_size,
+                }
+                torch.save(best_state, self.checkpoint_path)
+                print(f"Mejor modelo guardado en: {self.checkpoint_path}")
+
+        if best_state is None and Path(self.checkpoint_path).exists():
+            best_state = torch.load(self.checkpoint_path, map_location=self.device)
+
+        if best_state is not None:
+            model.load_state_dict(best_state["model_state_dict"])
+
+        _, y_true, y_pred = self.run_one_epoch(
+            model=model,
+            loader=test_loader,
+            criterion=criterion,
+            optimizer=None,
+            train=False,
+        )
+
+        return self.package_predictions(y_true, y_pred)
+
+    def validate_inputs(self, split_bundle):
+        if "train" not in split_bundle or "test" not in split_bundle:
+            raise ValueError("split_bundle debe incluir al menos 'train' y 'test'.")
+
+        if len(split_bundle["train"]) == 0:
+            raise ValueError("El split de entrenamiento está vacío.")
+
+        if len(split_bundle["test"]) == 0:
+            raise ValueError("El split de test está vacío.")
+
+    def prepare_label_mapping(self, split_bundle):
+        preferred_order = ["akiec", "bcc", "bkl", "df", "nv", "vasc", "mel"]
+        present_classes = sorted(set(split_bundle["train"]["dx"]).union(set(split_bundle["test"]["dx"])))
+
+        if set(present_classes).issubset(set(preferred_order)):
+            self.class_order = [c for c in preferred_order if c in present_classes]
+        else:
+            self.class_order = present_classes
+
+        self.class_to_idx = {class_name: idx for idx, class_name in enumerate(self.class_order)}
+        self.idx_to_class = {idx: class_name for class_name, idx in self.class_to_idx.items()}
+
+    def build_transforms(self):
+        imagenet_mean = [0.485, 0.456, 0.406]
+        imagenet_std = [0.229, 0.224, 0.225]
+
+        train_transform = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(20),
+            transforms.ColorJitter(brightness=0.10, contrast=0.10, saturation=0.10, hue=0.02),
+            transforms.ToTensor(),
+            transforms.Normalize(imagenet_mean, imagenet_std),
+        ])
+
+        eval_transform = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(imagenet_mean, imagenet_std),
+        ])
+
+        return train_transform, eval_transform
+
+    def build_dataloaders(self, split_bundle):
+        train_transform, eval_transform = self.build_transforms()
+
+        train_dataset = HAM10000ImageDataset(
+            split_bundle["train"],
+            class_to_idx=self.class_to_idx,
+            transform=train_transform,
+        )
+
+        test_dataset = HAM10000ImageDataset(
+            split_bundle["test"],
+            class_to_idx=self.class_to_idx,
+            transform=eval_transform,
+        )
+
+        val_loader = None
+        if "val" in split_bundle and len(split_bundle["val"]) > 0:
+            val_dataset = HAM10000ImageDataset(
+                split_bundle["val"],
+                class_to_idx=self.class_to_idx,
+                transform=eval_transform,
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=torch.cuda.is_available(),
+            )
+
+        train_labels = split_bundle["train"]["dx"].map(self.class_to_idx).to_numpy()
+
+        class_weights_loss = compute_class_weight(
+            class_weight="balanced",
+            classes=np.arange(len(self.class_order)),
+            y=train_labels,
+        )
+        class_weights_loss = torch.tensor(
+            class_weights_loss,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        if self.use_weighted_sampler:
+            class_sample_count = np.array([
+                np.sum(train_labels == class_id)
+                for class_id in range(len(self.class_order))
+            ])
+            class_sample_count = np.maximum(class_sample_count, 1)
+            class_weights_sampler = 1.0 / class_sample_count
+            sample_weights = class_weights_sampler[train_labels]
+            sampler = WeightedRandomSampler(
+                weights=torch.DoubleTensor(sample_weights),
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.batch_size,
+                sampler=sampler,
+                num_workers=self.num_workers,
+                pin_memory=torch.cuda.is_available(),
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                pin_memory=torch.cuda.is_available(),
+            )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        return train_loader, val_loader, test_loader, class_weights_loss
+
+    def build_model(self, num_classes):
+        weights = models.ConvNeXt_Tiny_Weights.DEFAULT if self.pretrained else None
+        model = models.convnext_tiny(weights=weights)
+        in_features = model.classifier[2].in_features
+        model.classifier[2] = nn.Linear(in_features, num_classes)
+        return model.to(self.device)
+
+    def run_one_epoch(self, model, loader, criterion=None, optimizer=None, train=False):
+        model.train() if train else model.eval()
+
+        losses = []
+        all_labels = []
+        all_preds = []
+
+        for images, labels in loader:
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+
+            if train:
+                optimizer.zero_grad()
+
+            with torch.set_grad_enabled(train):
+                logits = model(images)
+                preds = torch.argmax(logits, dim=1)
+
+                if criterion is not None:
+                    loss = criterion(logits, labels)
+                    losses.append(loss.item())
+
+                if train:
+                    loss.backward()
+                    optimizer.step()
+
+            all_labels.extend(labels.detach().cpu().numpy().tolist())
+            all_preds.extend(preds.detach().cpu().numpy().tolist())
+
+        metrics = {
+            "loss": float(np.mean(losses)) if losses else None,
+            "accuracy": accuracy_score(all_labels, all_preds),
+            "balanced_accuracy": balanced_accuracy_score(all_labels, all_preds),
+            "macro_f1": f1_score(all_labels, all_preds, average="macro"),
+        }
+
+        return metrics, all_labels, all_preds
+
+    def print_epoch_metrics(self, train_metrics, val_metrics=None):
+        print(
+            "TRAIN | "
+            f"loss={train_metrics['loss']:.4f} | "
+            f"acc={train_metrics['accuracy']:.4f} | "
+            f"bal_acc={train_metrics['balanced_accuracy']:.4f} | "
+            f"macro_f1={train_metrics['macro_f1']:.4f}"
+        )
+
+        if val_metrics is not None:
+            print(
+                "VAL   | "
+                f"loss={val_metrics['loss']:.4f} | "
+                f"acc={val_metrics['accuracy']:.4f} | "
+                f"bal_acc={val_metrics['balanced_accuracy']:.4f} | "
+                f"macro_f1={val_metrics['macro_f1']:.4f}"
+            )
+
+    def package_predictions(self, y_true, y_pred):
+        return {
+            "y_true": list(y_true),
+            "y_pred": list(y_pred),
+        }
+
+    def set_seed(self, seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+==================================================
+FICHERO: ./model_runners/densenet121_runner.py
+==================================================
+import torch.nn as nn
+from torchvision import models
+
+from ._image_runner_utils import BaseImageClassificationRunner
+
+
+class DenseNet121Runner(BaseImageClassificationRunner):
+    model_key = "densenet121"
+    img_size = 224
+
+    def build_model(self, num_classes):
+        weights = models.DenseNet121_Weights.IMAGENET1K_V1
+        model = models.densenet121(weights=weights)
+        in_features = model.classifier.in_features
+        model.classifier = nn.Linear(in_features, num_classes)
+        return model
+
+
+==================================================
+FICHERO: ./model_runners/efficientnet_b0_runner.py
+==================================================
+import os
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
+from sklearn.utils.class_weight import compute_class_weight
+from torch.optim import AdamW
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import models, transforms
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(reduction="none")
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+        pt = torch.exp(-ce_loss)
+        focal = (1 - pt) ** self.gamma * ce_loss
+
+        if self.alpha is not None:
+            focal = self.alpha[targets] * focal
+
+        if self.reduction == "mean":
+            return focal.mean()
+        if self.reduction == "sum":
+            return focal.sum()
+        return focal
+
+
+class HAM10000ImageDataset(Dataset):
+    def __init__(self, dataframe, transform=None, class_to_idx=None):
+        self.df = dataframe.reset_index(drop=True)
+        self.transform = transform
+        self.class_to_idx = class_to_idx or self._build_class_mapping(self.df)
+
+    @staticmethod
+    def _build_class_mapping(df):
+        classes = sorted(df["dx"].unique())
+        return {label: idx for idx, label in enumerate(classes)}
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        image = Image.open(row["path"]).convert("RGB")
+        label = self.class_to_idx[row["dx"]]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, int(label)
+
+
+class EfficientNetB0Runner:
+    """
+    Runner compatible with the project architecture.
+
+    Expected split_bundle:
+        {
+            "train": DataFrame with at least columns ["path", "dx"],
+            "val":   optional DataFrame with columns ["path", "dx"],
+            "test":  DataFrame with columns ["path", "dx"]
+        }
+
+    Returned predictions:
+        {"y_true": [...], "y_pred": [...]}
+
+    This class adapts the original EfficientNetB0_HAM10000 notebook by removing
+    dataset downloading and train/val/test splitting. Those responsibilities stay
+    in dataset_manager.py and split_manager.py, so all models share the same data
+    protocol for a fair paper comparison.
+    """
+
+    def __init__(
+        self,
+        epochs=12,
+        batch_size=32,
+        num_workers=2,
+        lr=1e-4,
+        weight_decay=1e-4,
+        img_size=224,
+        seed=42,
+        gamma=2.0,
+        save_dir="checkpoints",
+        model_name="efficientnet_b0",
+        use_weighted_sampler=True,
+        use_focal_loss=True,
+        freeze_backbone=False,
+    ):
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.img_size = img_size
+        self.seed = seed
+        self.gamma = gamma
+        self.save_dir = Path(save_dir)
+        self.model_name = model_name
+        self.use_weighted_sampler = use_weighted_sampler
+        self.use_focal_loss = use_focal_loss
+        self.freeze_backbone = freeze_backbone
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.history = []
+
+    def run(self, split_bundle):
+        self.set_seed(self.seed)
+        self.validate_inputs(split_bundle)
+
+        train_df = split_bundle["train"].copy().reset_index(drop=True)
+        test_df = split_bundle["test"].copy().reset_index(drop=True)
+        val_df = split_bundle.get("val")
+
+        if val_df is None or len(val_df) == 0:
+            val_df = test_df.copy().reset_index(drop=True)
+            print("[EfficientNetB0Runner] No validation split found. Using test split for model selection. For paper results, prefer a real validation split.")
+        else:
+            val_df = val_df.copy().reset_index(drop=True)
+
+        class_order = self.get_class_order(train_df, val_df, test_df)
+        class_to_idx = {label: idx for idx, label in enumerate(class_order)}
+
+        train_loader, val_loader, test_loader = self.build_dataloaders(
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            class_to_idx=class_to_idx,
+        )
+
+        model = self.build_model(num_classes=len(class_order))
+        criterion = self.build_criterion(train_df, class_to_idx)
+        optimizer = AdamW(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=2,
+        )
+
+        best_path = self.train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            class_order=class_order,
+        )
+
+        checkpoint = torch.load(best_path, map_location=self.device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        test_metrics, y_true, y_pred, _ = self.run_one_epoch(
+            model=model,
+            loader=test_loader,
+            criterion=criterion,
+            train=False,
+        )
+
+        print("\n[EfficientNetB0Runner] TEST")
+        for key, value in test_metrics.items():
+            print(f"{key}: {value:.4f}" if value == value else f"{key}: NaN")
+
+        return self.package_predictions(y_true, y_pred)
+
+    def validate_inputs(self, split_bundle):
+        for split_name in ["train", "test"]:
+            if split_name not in split_bundle:
+                raise ValueError(f"Missing required split: {split_name}")
+            required_columns = {"path", "dx"}
+            missing = required_columns - set(split_bundle[split_name].columns)
+            if missing:
+                raise ValueError(f"Split '{split_name}' is missing columns: {missing}")
+            if len(split_bundle[split_name]) == 0:
+                raise ValueError(f"Split '{split_name}' is empty")
+
+    def get_class_order(self, *dataframes):
+        preferred_order = ["akiec", "bcc", "bkl", "df", "nv", "vasc", "mel"]
+        present = set()
+        for df in dataframes:
+            present.update(df["dx"].dropna().unique().tolist())
+
+        ordered = [label for label in preferred_order if label in present]
+        ordered += sorted(present - set(ordered))
+        return ordered
+
+    def build_transforms(self):
+        imagenet_mean = [0.485, 0.456, 0.406]
+        imagenet_std = [0.229, 0.224, 0.225]
+
+        train_transform = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(20),
+            transforms.ColorJitter(brightness=0.10, contrast=0.10, saturation=0.10, hue=0.02),
+            transforms.ToTensor(),
+            transforms.Normalize(imagenet_mean, imagenet_std),
+        ])
+
+        eval_transform = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(imagenet_mean, imagenet_std),
+        ])
+
+        return train_transform, eval_transform
+
+    def build_dataloaders(self, train_df, val_df, test_df, class_to_idx):
+        train_transform, eval_transform = self.build_transforms()
+
+        train_dataset = HAM10000ImageDataset(train_df, train_transform, class_to_idx)
+        val_dataset = HAM10000ImageDataset(val_df, eval_transform, class_to_idx)
+        test_dataset = HAM10000ImageDataset(test_df, eval_transform, class_to_idx)
+
+        sampler = None
+        shuffle = True
+
+        if self.use_weighted_sampler:
+            train_labels = train_df["dx"].map(class_to_idx).values
+            class_counts = np.array([
+                max((train_labels == i).sum(), 1)
+                for i in range(len(class_to_idx))
+            ])
+            class_weights_sampler = 1.0 / class_counts
+            sample_weights = torch.DoubleTensor(class_weights_sampler[train_labels])
+            sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+            shuffle = False
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            shuffle=shuffle,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        return train_loader, val_loader, test_loader
+
+    def build_criterion(self, train_df, class_to_idx):
+        labels = train_df["dx"].map(class_to_idx).values
+        classes = np.arange(len(class_to_idx))
+
+        class_weights = compute_class_weight(
+            class_weight="balanced",
+            classes=classes,
+            y=labels,
+        )
+        class_weights = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
+
+        if self.use_focal_loss:
+            return FocalLoss(alpha=class_weights, gamma=self.gamma)
+
+        return nn.CrossEntropyLoss(weight=class_weights)
+
+    def build_model(self, num_classes):
+        weights = models.EfficientNet_B0_Weights.DEFAULT
+        model = models.efficientnet_b0(weights=weights)
+
+        if self.freeze_backbone:
+            for param in model.features.parameters():
+                param.requires_grad = False
+
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(in_features, num_classes)
+        return model.to(self.device)
+
+    def train_model(self, model, train_loader, val_loader, criterion, optimizer, scheduler, class_order):
+        best_macro_f1 = -1.0
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        best_path = self.save_dir / "best_efficientnet_b0_ham10000.pth"
+
+        for epoch in range(1, self.epochs + 1):
+            print(f"\n[EfficientNetB0Runner] Epoch {epoch}/{self.epochs}")
+
+            train_metrics, _, _, _ = self.run_one_epoch(
+                model=model,
+                loader=train_loader,
+                criterion=criterion,
+                optimizer=optimizer,
+                train=True,
+            )
+
+            val_metrics, _, _, _ = self.run_one_epoch(
+                model=model,
+                loader=val_loader,
+                criterion=criterion,
+                train=False,
+            )
+
+            scheduler.step(val_metrics["macro_f1"])
+
+            self.history.append({
+                "epoch": epoch,
+                **{f"train_{k}": v for k, v in train_metrics.items()},
+                **{f"val_{k}": v for k, v in val_metrics.items()},
+            })
+
+            print(
+                f"train_loss={train_metrics['loss']:.4f} | "
+                f"train_acc={train_metrics['accuracy']:.4f} | "
+                f"train_macro_f1={train_metrics['macro_f1']:.4f}"
+            )
+            print(
+                f"val_loss={val_metrics['loss']:.4f} | "
+                f"val_acc={val_metrics['accuracy']:.4f} | "
+                f"val_macro_f1={val_metrics['macro_f1']:.4f}"
+            )
+
+            if val_metrics["macro_f1"] > best_macro_f1:
+                best_macro_f1 = val_metrics["macro_f1"]
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_macro_f1": best_macro_f1,
+                    "class_order": class_order,
+                    "img_size": self.img_size,
+                    "history": self.history,
+                }, best_path)
+                print(f"[EfficientNetB0Runner] Best model saved: {best_path}")
+
+        return best_path
+
+    def run_one_epoch(self, model, loader, criterion=None, optimizer=None, train=False):
+        model.train() if train else model.eval()
+
+        losses = []
+        all_labels = []
+        all_preds = []
+        all_probs = []
+
+        for images, labels in loader:
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+
+            if train:
+                optimizer.zero_grad()
+
+            with torch.set_grad_enabled(train):
+                logits = model(images)
+                probs = torch.softmax(logits, dim=1)
+                preds = probs.argmax(dim=1)
+
+                if criterion is not None:
+                    loss = criterion(logits, labels)
+                    losses.append(loss.item())
+
+                if train:
+                    loss.backward()
+                    optimizer.step()
+
+            all_labels.extend(labels.detach().cpu().numpy())
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_probs.extend(probs.detach().cpu().numpy())
+
+        y_true = np.array(all_labels)
+        y_pred = np.array(all_preds)
+        y_prob = np.array(all_probs)
+
+        metrics = {
+            "loss": float(np.mean(losses)) if losses else float("nan"),
+            "accuracy": accuracy_score(y_true, y_pred),
+            "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+            "macro_f1": f1_score(y_true, y_pred, average="macro"),
+            "weighted_f1": f1_score(y_true, y_pred, average="weighted"),
+        }
+
+        try:
+            metrics["roc_auc_ovr"] = roc_auc_score(
+                y_true,
+                y_prob,
+                multi_class="ovr",
+                average="macro",
+            )
+        except Exception:
+            metrics["roc_auc_ovr"] = float("nan")
+
+        return metrics, y_true, y_pred, y_prob
+
+    def package_predictions(self, y_true, y_pred):
+        return {
+            "y_true": y_true.tolist(),
+            "y_pred": y_pred.tolist(),
+        }
+
+    @staticmethod
+    def set_seed(seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+==================================================
+FICHERO: ./model_runners/_image_runner_utils.py
+==================================================
+from pathlib import Path
+from collections import Counter
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import transforms
+from sklearn.utils.class_weight import compute_class_weight
+
+
+HAM10000_CLASS_ORDER = [
+    "akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"
+]
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+class HAM10000ImageDataset(Dataset):
+    def __init__(self, dataframe, transform=None, class_order=None):
+        self.df = dataframe.reset_index(drop=True).copy()
+        self.transform = transform
+        self.class_order = class_order or HAM10000_CLASS_ORDER
+        self.label_to_idx = {label: idx for idx, label in enumerate(self.class_order)}
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        image_path = row.get("path", row.get("image_path", None))
+        if image_path is None:
+            raise ValueError("The dataframe must include a 'path' or 'image_path' column")
+
+        image = Image.open(image_path).convert("RGB")
+
+        if "class_idx" in row:
+            label = int(row["class_idx"])
+        elif "label" in row:
+            label = int(row["label"])
+        elif "dx" in row:
+            label = self.label_to_idx[str(row["dx"])]
+        else:
+            raise ValueError("The dataframe must include 'class_idx', 'label' or 'dx'")
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, torch.tensor(label, dtype=torch.long)
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        ce_loss = nn.functional.cross_entropy(
+            logits,
+            targets,
+            weight=self.alpha,
+            reduction="none"
+        )
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        if self.reduction == "sum":
+            return focal_loss.sum()
+        return focal_loss
+
+
+class BaseImageClassificationRunner:
+    model_key = "base_image_model"
+    img_size = 224
+
+    def __init__(
+        self,
+        epochs=10,
+        batch_size=32,
+        learning_rate=1e-4,
+        weight_decay=1e-4,
+        num_workers=2,
+        gamma=2.0,
+        patience=5,
+        save_dir="checkpoints",
+        seed=42
+    ):
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.num_workers = num_workers
+        self.gamma = gamma
+        self.patience = patience
+        self.save_dir = Path(save_dir)
+        self.seed = seed
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.class_order = HAM10000_CLASS_ORDER
+
+    def run(self, split_bundle):
+        self.validate_inputs(split_bundle)
+        self.set_seed()
+
+        train_df = split_bundle["train"].reset_index(drop=True)
+        val_df = split_bundle.get("val")
+        test_df = split_bundle["test"].reset_index(drop=True)
+
+        if val_df is None or len(val_df) == 0:
+            val_df = test_df.copy()
+        else:
+            val_df = val_df.reset_index(drop=True)
+
+        train_loader, val_loader, test_loader = self.build_dataloaders(
+            train_df,
+            val_df,
+            test_df
+        )
+
+        model = self.build_model(num_classes=len(self.class_order)).to(self.device)
+        criterion = self.build_criterion(train_df)
+        optimizer = AdamW(
+            model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+
+        model = self.train_model(
+            model,
+            train_loader,
+            val_loader,
+            criterion,
+            optimizer
+        )
+
+        y_true, y_pred = self.predict(model, test_loader)
+        return self.package_predictions(y_true, y_pred)
+
+    def validate_inputs(self, split_bundle):
+        if "train" not in split_bundle or "test" not in split_bundle:
+            raise ValueError("split_bundle must include at least 'train' and 'test'")
+        for split_name in ["train", "test"]:
+            split = split_bundle[split_name]
+            if "path" not in split.columns and "image_path" not in split.columns:
+                raise ValueError(f"Split '{split_name}' must include a path or image_path column")
+
+    def set_seed(self):
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
+
+    def build_transforms(self):
+        train_transform = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(20),
+            transforms.ColorJitter(
+                brightness=0.10,
+                contrast=0.10,
+                saturation=0.10
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+
+        eval_transform = transforms.Compose([
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+
+        return train_transform, eval_transform
+
+    def get_labels(self, df):
+        if "class_idx" in df.columns:
+            return df["class_idx"].astype(int).values
+        if "label" in df.columns:
+            return df["label"].astype(int).values
+        if "dx" in df.columns:
+            mapping = {label: idx for idx, label in enumerate(self.class_order)}
+            return df["dx"].map(mapping).astype(int).values
+        raise ValueError("DataFrame must include class_idx, label or dx")
+
+    def build_dataloaders(self, train_df, val_df, test_df):
+        train_transform, eval_transform = self.build_transforms()
+
+        train_dataset = HAM10000ImageDataset(
+            train_df,
+            transform=train_transform,
+            class_order=self.class_order
+        )
+        val_dataset = HAM10000ImageDataset(
+            val_df,
+            transform=eval_transform,
+            class_order=self.class_order
+        )
+        test_dataset = HAM10000ImageDataset(
+            test_df,
+            transform=eval_transform,
+            class_order=self.class_order
+        )
+
+        train_labels = self.get_labels(train_df)
+        class_counts = np.array([
+            max((train_labels == i).sum(), 1)
+            for i in range(len(self.class_order))
+        ])
+        class_weights_sampler = 1.0 / class_counts
+        sample_weights = torch.DoubleTensor(class_weights_sampler[train_labels])
+
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+
+        pin_memory = self.device.type == "cuda"
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            num_workers=self.num_workers,
+            pin_memory=pin_memory
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=pin_memory
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=pin_memory
+        )
+
+        return train_loader, val_loader, test_loader
+
+    def build_criterion(self, train_df):
+        train_labels = self.get_labels(train_df)
+        present_classes = np.unique(train_labels)
+
+        weights = np.ones(len(self.class_order), dtype=np.float32)
+        if len(present_classes) > 1:
+            computed = compute_class_weight(
+                class_weight="balanced",
+                classes=present_classes,
+                y=train_labels
+            )
+            for cls, weight in zip(present_classes, computed):
+                weights[int(cls)] = float(weight)
+
+        weights_tensor = torch.tensor(
+            weights,
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        return FocalLoss(alpha=weights_tensor, gamma=self.gamma)
+
+    def train_model(self, model, train_loader, val_loader, criterion, optimizer):
+        best_val_loss = float("inf")
+        best_state = None
+        epochs_without_improvement = 0
+
+        for epoch in range(self.epochs):
+            train_loss, train_acc = self.train_one_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer
+            )
+            val_loss, val_acc = self.evaluate(model, val_loader, criterion)
+
+            print(
+                f"[{self.model_key}] Epoch {epoch + 1:02d}/{self.epochs} "
+                f"| train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+                f"| val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+                epochs_without_improvement = 0
+                self.save_checkpoint(model, optimizer, epoch, best_val_loss)
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= self.patience:
+                print(f"[{self.model_key}] Early stopping")
+                break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        return model
+
+    def train_one_epoch(self, model, loader, criterion, optimizer):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        for images, targets in loader:
+            images = images.to(self.device)
+            targets = targets.to(self.device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            logits = self.extract_logits(outputs)
+            loss = criterion(logits, targets)
+
+            if hasattr(outputs, "aux_logits") and outputs.aux_logits is not None:
+                loss = loss + 0.4 * criterion(outputs.aux_logits, targets)
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * images.size(0)
+            preds = logits.argmax(dim=1)
+            correct += (preds == targets).sum().item()
+            total += targets.size(0)
+
+        return running_loss / max(total, 1), correct / max(total, 1)
+
+    @torch.no_grad()
+    def evaluate(self, model, loader, criterion):
+        model.eval()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        for images, targets in loader:
+            images = images.to(self.device)
+            targets = targets.to(self.device)
+            outputs = model(images)
+            logits = self.extract_logits(outputs)
+            loss = criterion(logits, targets)
+
+            running_loss += loss.item() * images.size(0)
+            preds = logits.argmax(dim=1)
+            correct += (preds == targets).sum().item()
+            total += targets.size(0)
+
+        return running_loss / max(total, 1), correct / max(total, 1)
+
+    @torch.no_grad()
+    def predict(self, model, loader):
+        model.eval()
+        y_true = []
+        y_pred = []
+
+        for images, targets in loader:
+            images = images.to(self.device)
+            outputs = model(images)
+            logits = self.extract_logits(outputs)
+            preds = logits.argmax(dim=1).detach().cpu().tolist()
+
+            y_pred.extend(preds)
+            y_true.extend(targets.tolist())
+
+        return y_true, y_pred
+
+    def extract_logits(self, outputs):
+        if hasattr(outputs, "logits"):
+            return outputs.logits
+        return outputs
+
+    def save_checkpoint(self, model, optimizer, epoch, val_loss):
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        path = self.save_dir / f"{self.model_key}_best.pth"
+        torch.save({
+            "model_key": self.model_key,
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "class_order": self.class_order,
+            "img_size": self.img_size,
+        }, path)
+
+    def package_predictions(self, y_true, y_pred):
+        return {
+            "y_true": list(map(int, y_true)),
+            "y_pred": list(map(int, y_pred))
+        }
+
+    def build_model(self, num_classes):
+        raise NotImplementedError
+
+
+==================================================
+FICHERO: ./model_runners/inception_v3_runner.py
+==================================================
+import torch.nn as nn
+from torchvision import models
+
+from ._image_runner_utils import BaseImageClassificationRunner
+
+
+class InceptionV3Runner(BaseImageClassificationRunner):
+    model_key = "inception_v3"
+    img_size = 299
+
+    def build_model(self, num_classes):
+        weights = models.Inception_V3_Weights.IMAGENET1K_V1
+        model = models.inception_v3(weights=weights, aux_logits=True)
+        in_features = model.fc.in_features
+        model.fc = nn.Linear(in_features, num_classes)
+
+        if model.AuxLogits is not None:
+            aux_in_features = model.AuxLogits.fc.in_features
+            model.AuxLogits.fc = nn.Linear(aux_in_features, num_classes)
+
+        return model
+
+
+==================================================
+FICHERO: ./model_runners/__init__.py
+==================================================
+
+
+
+==================================================
+FICHERO: ./model_runners/mlp_runner.py
+==================================================
+import torch
+import torch.nn as nn
+import numpy as np
+
+from torch.utils.data import (
+    TensorDataset,
+    DataLoader
+)
+
+
+class MLP(nn.Module):
+
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+
+        self.layers = nn.Sequential(
+
+            nn.Linear(
+                input_dim,
+                256
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.2),
+
+            nn.Linear(
+                256,
+                num_classes
+            )
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class MLPRunner:
+
+    def run(self, split_bundle):
+
+        self.validate_inputs(
+            split_bundle
+        )
+
+        x_train, y_train = self.prepare_split(
+            split_bundle["train"]
+        )
+
+        x_test, y_test = self.prepare_split(
+            split_bundle["test"]
+        )
+
+        print("\n===== TRAIN INFO =====")
+
+        print(
+            f"Train samples: {len(x_train)}"
+        )
+
+        unique, counts = np.unique(
+            y_train.numpy(),
+            return_counts=True
+        )
+
+        print("Class distribution:")
+
+        for cls, count in zip(unique, counts):
+
+            print(
+                f"Class {cls}: {count}"
+            )
+
+        model = self.train_model(
+            x_train,
+            y_train
+        )
+
+        predictions = self.predict(
+            model,
+            x_test
+        )
+
+        return self.package_predictions(
+            y_test,
+            predictions
+        )
+
+    def validate_inputs(
+        self,
+        split_bundle
+    ):
+
+        if "embedding" not in split_bundle["train"]:
+
+            raise ValueError(
+                "Embeddings required"
+            )
+
+    def prepare_split(
+        self,
+        split
+    ):
+
+        x = torch.tensor(
+            np.array(
+                split["embedding"].tolist()
+            ),
+            dtype=torch.float32
+        )
+
+        classes = sorted(
+            split["dx"].unique()
+        )
+
+        mapping = {
+            label: idx
+            for idx, label in enumerate(classes)
+        }
+
+        y = torch.tensor(
+            split["dx"].map(mapping).tolist(),
+            dtype=torch.long
+        )
+
+        return x, y
+
+    def train_model(
+        self,
+        x,
+        y
+    ):
+
+        model = MLP(
+            x.shape[1],
+            len(y.unique())
+        )
+
+        model.train()
+
+        dataset = TensorDataset(
+            x,
+            y
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_size=16,
+            shuffle=True
+        )
+
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=1e-3
+        )
+
+        loss_fn = nn.CrossEntropyLoss()
+
+        for epoch in range(15):
+
+            epoch_loss = 0
+            correct = 0
+            total = 0
+
+            for x_batch, y_batch in loader:
+
+                logits = model(
+                    x_batch
+                )
+
+                loss = loss_fn(
+                    logits,
+                    y_batch
+                )
+
+                optimizer.zero_grad()
+
+                loss.backward()
+
+                optimizer.step()
+
+                epoch_loss += loss.item()
+
+                preds = logits.argmax(
+                    dim=1
+                )
+
+                correct += (
+                    preds == y_batch
+                ).sum().item()
+
+                total += len(y_batch)
+
+            avg_loss = (
+                epoch_loss / len(loader)
+            )
+
+            acc = correct / total
+
+            print(
+                f"Epoch {epoch+1:02d} "
+                f"| Loss: {avg_loss:.4f} "
+                f"| Train Acc: {acc:.4f}"
+            )
+
+        return model
+
+    def predict(
+        self,
+        model,
+        x
+    ):
+
+        model.eval()
+
+        with torch.no_grad():
+
+            return model(x).argmax(
+                dim=1
+            )
+
+    def package_predictions(
+        self,
+        y_true,
+        y_pred
+    ):
+
+        return {
+            "y_true": y_true.tolist(),
+            "y_pred": y_pred.tolist()
+        }
+
+
+==================================================
+FICHERO: ./model_runners/mobilenet_v2_runner.py
+==================================================
+import torch.nn as nn
+from torchvision import models
+
+from ._image_runner_utils import BaseImageClassificationRunner
+
+
+class MobileNetV2Runner(BaseImageClassificationRunner):
+    model_key = "mobilenet_v2"
+    img_size = 224
+
+    def build_model(self, num_classes):
+        weights = models.MobileNet_V2_Weights.IMAGENET1K_V1
+        model = models.mobilenet_v2(weights=weights)
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(in_features, num_classes)
+        return model
+
+
+==================================================
+FICHERO: ./model_runners/resnet50_runner.py
+==================================================
+import torch.nn as nn
+from torchvision import models
+
+from ._image_runner_utils import BaseImageClassificationRunner
+
+
+class ResNet50Runner(BaseImageClassificationRunner):
+    model_key = "resnet50"
+    img_size = 224
+
+    def build_model(self, num_classes):
+        weights = models.ResNet50_Weights.IMAGENET1K_V2
+        model = models.resnet50(weights=weights)
+        in_features = model.fc.in_features
+        model.fc = nn.Linear(in_features, num_classes)
+        return model
+
+
+==================================================
+FICHERO: ./model_runners/vit_b16_runner.py
+==================================================
+import torch.nn as nn
+from torchvision import models
+
+from ._image_runner_utils import BaseImageClassificationRunner
+
+
+class ViTB16Runner(BaseImageClassificationRunner):
+    model_key = "vit_b16"
+    img_size = 224
+
+    def build_model(self, num_classes):
+        weights = models.ViT_B_16_Weights.IMAGENET1K_V1
+        model = models.vit_b_16(weights=weights)
+        in_features = model.heads.head.in_features
+        model.heads.head = nn.Linear(in_features, num_classes)
+        return model
+
+
+==================================================
+FICHERO: ./readme.md
+==================================================
+| Modelo            | Variante | Train |  Val | Test | LoRA | Augment. |
+| ----------------- | -------- | ----: | ---: | ---: | ---: | -------- |
+| Embeddings        | MLP      |   350 |    0 | 9650 |    0 | No       |
+| Embeddings        | SVM      |   350 |    0 | 9650 |    0 | No       |
+| Fine-tuning       | CNN      |  8000 | 1000 | 1000 |    0 | Sí       |
+| Embeddings + LoRA | MLP      |   350 |  500 | 9150 |  700 | Sí       |
+
+
+| Modelo   | Acc. Global | Melanoma |   n | Nevus |    n |  BCC |   n | ... |
+| -------- | ----------: | -------: | --: | ----: | ---: | ---: | --: | --- |
+| Modelo A |         81% |      74% | 420 |   89% | 3800 |  77% | 210 | ... |
+| Modelo B |         93% |      95% |  18 |   92% |   25 | 100% |   9 | ... |
+
+
+| Modelo | MEL FN | MEL n | BCC FN | BCC n | AKIEC FN | AKIEC n |
+| ------ | -----: | ----: | -----: | ----: | -------: | ------: |
+
+
+| Model   | Global Acc. | 95% CI    | Melanoma | Mel CI | Mel n | Nevus | Nevus CI | Nevus n | ... |
+| ------- | ----------: | --------- | -------: | ------ | ----: | ----: | -------- | ------: | --- |
+| Model A |       81.0% | 80.2–81.8 |    74.0% | 69–78  |   420 | 89.0% | 88–90    |    3800 | ... |
+| Model B |       93.0% | 81–99     |    95.0% | 73–99  |    18 | 92.0% | 75–98    |      25 | ... |
+
+
+| Model   | MEL FN | MEL n | MEL FN Rate | MEL CI | BCC FN | BCC n | BCC CI |
+| ------- | -----: | ----: | ----------: | ------ | -----: | ----: | ------ |
+| Model A |    122 |   420 |       29.0% | 25–34  |    ... |   ... | ...    |
+| Model B |      1 |    18 |        5.5% | 0–27   |    ... |   ... | ...    |
+
+
+
+==================================================
+FICHERO: ./README.md
+==================================================
+# Versión definitiva del proyecto TFM HAM10000
+
+Esta versión fusiona lo mejor de `contenido_ismael` y `contenido_completo`.
+
+## Criterio de fusión
+
+Se toma como base `contenido_ismael` porque incluye una batería de modelos más completa:
+
+- DINOv2 + centroides
+- DINOv2 + MLP
+- EfficientNetB0
+- ConvNeXt-Tiny
+- MobileNetV2
+- ViT-B/16
+- ResNet50
+- DenseNet121
+- InceptionV3
+
+Y se incorpora la idea metodológica más importante de `contenido_completo`:
+
+- particionado flexible,
+- soporte few-shot,
+- soporte porcentajes,
+- y augmentación real asociada al pipeline de imágenes, no duplicación simple de filas.
+
+## Mejoras principales
+
+### 1. Split sin fuga de información
+
+El nuevo `SplitManager` divide por `lesion_id`, no solo por imagen.  
+Esto es esencial en HAM10000 porque una misma lesión puede tener varias imágenes. Si una imagen de la misma lesión cae en train y otra en test, el resultado queda artificialmente inflado.
+
+### 2. Escenarios experimentales claros
+
+En `config.py` se definen tres escenarios:
+
+```text
+few_shot_50
+few_shot_100
+stratified_70_15_15
+```
+
+Esto permite defender en el paper tanto la comparación con pocos datos como la comparación clásica con más datos.
+
+### 3. Test común para todos los modelos
+
+Para un mismo escenario y una misma semilla, todos los modelos reciben la misma partición.  
+Esto hace que la comparación entre fine-tuning y embeddings sea metodológicamente justa.
+
+### 4. Augmentación real
+
+La augmentación no se realiza duplicando filas en el `SplitManager`.  
+Se aplica en los transforms de PyTorch dentro de los runners de imagen:
+
+- flips
+- rotaciones
+- color jitter
+- normalización ImageNet
+
+Esto evita inflar artificialmente el dataset con copias estáticas.
+
+### 5. Métricas clínicas
+
+El nuevo `MetricsGenerator` calcula:
+
+- Accuracy
+- Balanced accuracy
+- Macro F1
+- Weighted F1
+- Recall por clase
+- Precision por clase
+- F1 por clase
+- Falsos negativos por clase
+- Intervalos de confianza Wilson
+- Matrices de confusión
+
+Para el paper, la métrica prioritaria debe ser la sensibilidad de melanoma y la tasa de falsos negativos de melanoma.
+
+## Ejecución
+
+### Ejecutar escenario por defecto
+
+```bash
+python main.py
+```
+
+### Ejecutar solo embeddings
+
+```bash
+python main.py --only-embeddings
+```
+
+### Ejecutar solo modelos de imagen
+
+```bash
+python main.py --only-images
+```
+
+### Ejecutar un escenario concreto
+
+```bash
+python main.py --scenario few_shot_100
+```
+
+```bash
+python main.py --scenario stratified_70_15_15
+```
+
+### Ejecutar con una sola semilla para pruebas rápidas
+
+```bash
+python main.py --seeds 42
+```
+
+## Salidas generadas
+
+```text
+results/
+├── table_1_experimental_plan.csv
+├── table_2_performance.csv
+├── table_3_false_negatives.csv
+├── confusion_matrices/
+├── splits/
+└── cache/
+```
+
+## Uso recomendado para el TFM
+
+La estructura experimental recomendada para el documento es:
+
+1. Ejecutar `few_shot_50` para analizar comportamiento con pocos datos.
+2. Ejecutar `few_shot_100` para ver si los embeddings escalan bien.
+3. Ejecutar `stratified_70_15_15` para comparar con el protocolo clásico.
+4. Repetir al menos con tres semillas: 42, 1337 y 2026.
+5. Reportar media y desviación típica de:
+   - balanced accuracy,
+   - macro F1,
+   - recall melanoma,
+   - false negative rate melanoma.
+
+## Advertencia metodológica
+
+Si BiomedCLIP aparece en el paper como modelo evaluado, debe añadirse como extractor real en `feature_extractor.py`.  
+Si no se implementa, debe mencionarse solo como trabajo futuro.
+
+
+
+==================================================
+FICHERO: ./split_manager.py
+==================================================
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass(frozen=True)
+class SplitDirective:
+    train: int | float
+    val: int | float
+    test: int | float | str
+    group_by: str = "lesion_id"
+
+
+class SplitManager:
+    """
+    Gestor de particiones definitivo para HAM10000.
+
+    Mejoras frente a las versiones previas:
+    - Evita fuga de información dividiendo por `lesion_id`, no por imagen aislada.
+    - Soporta few-shot por clase: train=50, val=10, test="rest".
+    - Soporta porcentajes estratificados: train=0.70, val=0.15, test=0.15.
+    - Mantiene el mismo test para todos los modelos si se usa el mismo seed y escenario.
+    - No duplica filas para "augmentación"; la augmentación real queda en los transforms
+      de PyTorch de los runners de imagen.
+    - Puede exportar los CSV de train/val/test para documentar el protocolo experimental.
+    """
+
+    def __init__(
+        self,
+        seed: int = 42,
+        split_dir: str | Path = "splits",
+        export_splits: bool = True,
+    ):
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+        self.split_dir = Path(split_dir)
+        self.export_splits = export_splits
+
+    def prepare_split(self, dataset: pd.DataFrame, experiment_config: dict[str, Any]) -> dict[str, pd.DataFrame]:
+        directive = SplitDirective(
+            train=experiment_config["train"],
+            val=experiment_config.get("val", 0),
+            test=experiment_config.get("test", "rest"),
+            group_by=experiment_config.get("group_by", "lesion_id"),
+        )
+
+        self.validate_dataset(dataset, directive.group_by)
+
+        if self.is_percentage_protocol(directive):
+            subsets = self.select_by_percentages(dataset, directive)
+        else:
+            subsets = self.select_few_shot(dataset, directive)
+
+        subsets = self.ensure_columns_and_order(subsets)
+
+        if self.export_splits:
+            self.export_split_csvs(subsets, experiment_config)
+
+        return subsets
+
+    def validate_dataset(self, dataset: pd.DataFrame, group_by: str) -> None:
+        required = {"dx", "image_path"}
+        missing = required - set(dataset.columns)
+        if missing:
+            raise ValueError(f"Faltan columnas obligatorias en el dataset: {sorted(missing)}")
+
+        if group_by not in dataset.columns:
+            raise ValueError(
+                f"No existe la columna '{group_by}'. Para HAM10000 se recomienda dividir por lesion_id."
+            )
+
+        if dataset["image_path"].isna().any():
+            raise ValueError("Existen imágenes sin ruta en image_path.")
+
+        if dataset["dx"].isna().any():
+            raise ValueError("Existen muestras sin etiqueta dx.")
+
+    def is_percentage_protocol(self, directive: SplitDirective) -> bool:
+        values = [directive.train, directive.val, directive.test]
+        numeric_values = [v for v in values if isinstance(v, (int, float))]
+        return all(isinstance(v, float) and 0 <= v <= 1 for v in numeric_values) and directive.test != "rest"
+
+    def build_group_table(self, dataset: pd.DataFrame, group_by: str) -> pd.DataFrame:
+        group_table = (
+            dataset.groupby(group_by, as_index=False)
+            .agg(dx=("dx", "first"), n_images=("image_path", "size"))
+        )
+
+        inconsistent = (
+            dataset.groupby(group_by)["dx"]
+            .nunique()
+            .reset_index(name="n_labels")
+            .query("n_labels > 1")
+        )
+        if len(inconsistent) > 0:
+            raise ValueError(
+                "Hay grupos con más de una etiqueta. Revisa lesion_id/dx antes de particionar."
+            )
+
+        return group_table
+
+    def select_few_shot(self, dataset: pd.DataFrame, directive: SplitDirective) -> dict[str, pd.DataFrame]:
+        group_table = self.build_group_table(dataset, directive.group_by)
+        selected_groups: dict[str, set] = {"train": set(), "val": set(), "test": set()}
+
+        for class_name in sorted(group_table["dx"].unique()):
+            class_groups = group_table[group_table["dx"] == class_name][directive.group_by].to_numpy()
+            self.rng.shuffle(class_groups)
+
+            train_n = int(directive.train)
+            val_n = int(directive.val) if directive.val != "rest" else 0
+
+            train_groups = class_groups[:train_n]
+            val_groups = class_groups[train_n:train_n + val_n]
+            rest_groups = class_groups[train_n + val_n:]
+
+            selected_groups["train"].update(train_groups)
+            selected_groups["val"].update(val_groups)
+
+            if directive.test == "rest":
+                selected_groups["test"].update(rest_groups)
+            else:
+                test_n = int(directive.test)
+                selected_groups["test"].update(rest_groups[:test_n])
+
+        return {
+            split_name: dataset[dataset[directive.group_by].isin(groups)].copy()
+            for split_name, groups in selected_groups.items()
+        }
+
+    def select_by_percentages(self, dataset: pd.DataFrame, directive: SplitDirective) -> dict[str, pd.DataFrame]:
+        group_table = self.build_group_table(dataset, directive.group_by)
+        selected_groups: dict[str, set] = {"train": set(), "val": set(), "test": set()}
+
+        for class_name in sorted(group_table["dx"].unique()):
+            class_groups = group_table[group_table["dx"] == class_name][directive.group_by].to_numpy()
+            self.rng.shuffle(class_groups)
+
+            total = len(class_groups)
+            train_n = int(round(total * float(directive.train)))
+            val_n = int(round(total * float(directive.val)))
+
+            # Asegura que no se sobrepase por redondeos.
+            train_n = min(train_n, total)
+            val_n = min(val_n, total - train_n)
+
+            train_groups = class_groups[:train_n]
+            val_groups = class_groups[train_n:train_n + val_n]
+            test_groups = class_groups[train_n + val_n:]
+
+            selected_groups["train"].update(train_groups)
+            selected_groups["val"].update(val_groups)
+            selected_groups["test"].update(test_groups)
+
+        return {
+            split_name: dataset[dataset[directive.group_by].isin(groups)].copy()
+            for split_name, groups in selected_groups.items()
+        }
+
+    def ensure_columns_and_order(self, subsets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        ordered = {}
+        for split_name, df in subsets.items():
+            df = df.copy().reset_index(drop=True)
+
+            if "path" not in df.columns:
+                df["path"] = df["image_path"]
+
+            # Orden estable para reproducibilidad visual y de cachés.
+            sort_columns = [col for col in ["dx", "lesion_id", "image_id"] if col in df.columns]
+            if sort_columns:
+                df = df.sort_values(sort_columns).reset_index(drop=True)
+
+            ordered[split_name] = df
+
+        for required_split in ["train", "val", "test"]:
+            if required_split not in ordered:
+                ordered[required_split] = pd.DataFrame(columns=next(iter(ordered.values())).columns)
+
+        return ordered
+
+    def export_split_csvs(self, subsets: dict[str, pd.DataFrame], experiment_config: dict[str, Any]) -> None:
+        scenario = experiment_config.get("scenario", "scenario")
+        seed = experiment_config.get("seed", self.seed)
+        split_path = self.split_dir / f"{scenario}_seed_{seed}"
+        split_path.mkdir(parents=True, exist_ok=True)
+
+        for split_name, df in subsets.items():
+            export_columns = [
+                col for col in [
+                    "lesion_id", "image_id", "dx", "class_idx",
+                    "readable_label", "image_path"
+                ]
+                if col in df.columns
+            ]
+            df[export_columns].to_csv(split_path / f"{split_name}.csv", index=False)
+
+        summary = []
+        for split_name, df in subsets.items():
+            counts = df["dx"].value_counts().sort_index()
+            for class_name, count in counts.items():
+                summary.append({
+                    "split": split_name,
+                    "class": class_name,
+                    "n_images": int(count),
+                    "n_lesions": int(df[df["dx"] == class_name]["lesion_id"].nunique())
+                    if "lesion_id" in df.columns else None,
+                })
+
+        pd.DataFrame(summary).to_csv(split_path / "split_summary.csv", index=False)
+
+
+
+==================================================
+FICHERO: ./table_1.csv
+==================================================
+input_mode,runner,feature_extractor,train,val,test,lora,augmentation
+embeddings,centroid,dinov2,50,0,rest,0,False
+embeddings,mlp,dinov2,50,0,rest,0,False
+embeddings,mlp,dinov2,70,0,rest,0,False
+
+
+
+==================================================
+FICHERO: ./test2.py
+==================================================
+import os
+import pandas as pd
+import kagglehub
+
+from transformers import AutoImageProcessor, AutoModel
+
+import torch
+from PIL import Image
+import numpy as np
+
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
+
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+
+from sklearn.metrics import (
+    adjusted_rand_score,
+    normalized_mutual_info_score
+)
+
+from sklearn.metrics.cluster import contingency_matrix
+
+from sklearn.mixture import GaussianMixture
+
+from sklearn.mixture import GaussianMixture
+
+def unsupervised_analysis_gmm(
+    embeddings,
+    labels
+):
+
+    print("\nNormalizando...")
+
+    scaler = StandardScaler()
+
+    X = scaler.fit_transform(
+        embeddings
+    )
+
+    # mayor estabilidad numérica
+    X = X.astype(
+        np.float64
+    )
+
+    encoder = LabelEncoder()
+
+    y_true = encoder.fit_transform(
+        labels
+    )
+
+    n_classes = len(
+        encoder.classes_
+    )
+
+    print(
+        f"GMM con k={n_classes}"
+    )
+
+    gmm = GaussianMixture(
+        n_components=n_classes,
+        covariance_type="diag",
+        reg_covar=1e-4,
+        n_init=5,
+        random_state=42
+    )
+
+    clusters = gmm.fit_predict(
+        X
+    )
+
+    ari = adjusted_rand_score(
+        y_true,
+        clusters
+    )
+
+    nmi = normalized_mutual_info_score(
+        y_true,
+        clusters
+    )
+
+    print("\nRESULTADOS")
+
+    print(
+        f"ARI: {ari:.4f}"
+    )
+
+    print(
+        f"NMI: {nmi:.4f}"
+    )
+
+    cm = contingency_matrix(
+        y_true,
+        clusters
+    )
+
+    df_cm = pd.DataFrame(
+        cm,
+        index=encoder.classes_,
+        columns=[
+            f"cluster_{i}"
+            for i in range(
+                n_classes
+            )
+        ]
+    )
+
+    print(
+        "\nClase real vs cluster:"
+    )
+
+    print(
+        df_cm
+    )
+
+def sample_balanced(
+    df,
+    n_per_class=100,
+    random_state=42
+):
+    """
+    Selecciona n muestras por clase.
+
+    Si una clase tiene menos de n,
+    coge todas.
+    """
+
+    df_balanced = pd.concat(
+        [
+            group.sample(
+                n=min(
+                    len(group),
+                    n_per_class
+                ),
+                random_state=random_state
+            )
+            for _, group in df.groupby(
+                "dx"
+            )
+        ]
+    ).reset_index(
+        drop=True
+    )
+
+    print(
+        "\nDistribución balanceada:"
+    )
+
+    print(
+        df_balanced["dx"].value_counts()
+    )
+
+    print(
+        f"\nTotal muestras: "
+        f"{len(df_balanced)}"
+    )
+
+    return df_balanced
+# =========================
+# EMBEDDINGS
+# =========================
+
+def load_dinov2():
+
+    model_name = "facebook/dinov2-base"
+
+    processor = AutoImageProcessor.from_pretrained(
+        model_name
+    )
+
+    model = AutoModel.from_pretrained(
+        model_name
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model.to(device)
+
+    model.eval()
+
+    print(f"Modelo cargado en {device}")
+
+    return processor, model, device
+
+
+def load_image(path):
+
+    return Image.open(path).convert("RGB")
+
+
+def get_embedding(
+    image,
+    processor,
+    model,
+    device
+):
+
+    inputs = processor(
+        images=image,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+
+        outputs = model(**inputs)
+
+    # CLS token
+    #embedding = outputs.last_hidden_state[:, 0, :]
+    embedding = outputs.last_hidden_state.mean(dim=1)
+    return embedding.cpu().numpy().flatten()
+
+
+def generate_all_embeddings(
+    df,
+    processor,
+    model,
+    device
+):
+
+    embeddings = []
+    labels = []
+
+    total = len(df)
+
+    for i, (_, row) in enumerate(df.iterrows()):
+
+        if i % 500 == 0:
+            print(f"{i}/{total}")
+
+        try:
+
+            image = load_image(
+                row["path"]
+            )
+
+            emb = get_embedding(
+                image,
+                processor,
+                model,
+                device
+            )
+
+            embeddings.append(
+                emb
+            )
+
+            labels.append(
+                row["dx"]
+            )
+
+        except Exception as e:
+
+            print(
+                f"Error {row['path']}: {e}"
+            )
+
+    return (
+        np.array(embeddings),
+        np.array(labels)
+    )
+
+
+# =========================
+# DATASET
+# =========================
+
+def download_dataset():
+
+    path = kagglehub.dataset_download(
+        "kmader/skin-cancer-mnist-ham10000"
+    )
+
+    if "HAM10000_metadata.csv" in os.listdir(path):
+
+        return path
+
+    versions_path = os.path.join(
+        path,
+        "versions"
+    )
+
+    version = os.listdir(
+        versions_path
+    )[0]
+
+    return os.path.join(
+        versions_path,
+        version
+    )
+
+
+def load_metadata(base_path):
+
+    metadata_path = os.path.join(
+        base_path,
+        "HAM10000_metadata.csv"
+    )
+
+    df = pd.read_csv(
+        metadata_path
+    )
+
+    return df
+
+
+def build_image_paths(
+    base_path,
+    df
+):
+
+    img_dir_1 = os.path.join(
+        base_path,
+        "HAM10000_images_part_1"
+    )
+
+    img_dir_2 = os.path.join(
+        base_path,
+        "HAM10000_images_part_2"
+    )
+
+    image_paths = {}
+
+    for folder in [
+        img_dir_1,
+        img_dir_2
+    ]:
+
+        for img in os.listdir(folder):
+
+            image_id = img.split(".")[0]
+
+            image_paths[image_id] = os.path.join(
+                folder,
+                img
+            )
+
+    df["path"] = df["image_id"].map(
+        image_paths
+    )
+
+    return df
+
+
+# =========================
+# UNSUPERVISED
+# =========================
+
+def unsupervised_analysis(
+    embeddings,
+    labels
+):
+
+    print("\nNormalizando...")
+
+    scaler = StandardScaler()
+
+    X = scaler.fit_transform(
+        embeddings
+    )
+
+    print("PCA...")
+
+    pca = PCA(
+        n_components=0.95
+    )
+
+    X = pca.fit_transform(
+        X
+    )
+
+    print(
+        f"Dim PCA: {X.shape[1]}"
+    )
+
+    # labels reales -> int
+    encoder = LabelEncoder()
+
+    y_true = encoder.fit_transform(
+        labels
+    )
+
+    n_classes = len(
+        encoder.classes_
+    )
+
+    print(
+        f"KMeans con k={n_classes}"
+    )
+
+    kmeans = KMeans(
+        n_clusters=n_classes,
+        random_state=42,
+        n_init=20
+    )
+
+    clusters = kmeans.fit_predict(
+        X
+    )
+
+    # métricas
+    ari = adjusted_rand_score(
+        y_true,
+        clusters
+    )
+
+    nmi = normalized_mutual_info_score(
+        y_true,
+        clusters
+    )
+
+    print("\nRESULTADOS")
+    print(
+        f"ARI: {ari:.4f}"
+    )
+
+    print(
+        f"NMI: {nmi:.4f}"
+    )
+
+    # tabla cluster vs clase
+    cm = contingency_matrix(
+        y_true,
+        clusters
+    )
+
+    df_cm = pd.DataFrame(
+        cm,
+        index=encoder.classes_,
+        columns=[
+            f"cluster_{i}"
+            for i in range(
+                n_classes
+            )
+        ]
+    )
+
+    print(
+        "\nClase real vs cluster:"
+    )
+
+    print(
+        df_cm
+    )
+
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+
+    base_path = download_dataset()
+
+    df = load_metadata(
+        base_path
+    )
+
+    df = build_image_paths(
+        base_path,
+        df
+    )
+
+    processor, model, device = load_dinov2()
+    
+    df = sample_balanced(
+        df,
+        n_per_class=100
+    )
+
+    embeddings, labels = generate_all_embeddings(
+        df,
+        processor,
+        model,
+        device
+    )
+    unsupervised_analysis(
+        embeddings,
+        labels
+    )
+
+    unsupervised_analysis_gmm(
+        embeddings,
+        labels
+    )
+
+
+
+if __name__ == "__main__":
+    main()
+
+
+==================================================
+FICHERO: ./test3.py
+==================================================
+import os
+import pandas as pd
+import kagglehub
+
+from transformers import AutoImageProcessor, AutoModel
+
+import torch
+import torch.nn as nn
+
+from PIL import Image
+import numpy as np
+
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import confusion_matrix
+
+
+# =========================
+# DATASET
+# =========================
+
+def download_dataset():
+
+    path = kagglehub.dataset_download(
+        "kmader/skin-cancer-mnist-ham10000"
+    )
+
+    if "HAM10000_metadata.csv" in os.listdir(
+        path
+    ):
+
+        print(
+            f"Dataset listo en: {path}"
+        )
+
+        return path
+
+    versions_path = os.path.join(
+        path,
+        "versions"
+    )
+
+    if os.path.exists(
+        versions_path
+    ):
+
+        version = os.listdir(
+            versions_path
+        )[0]
+
+        real_path = os.path.join(
+            versions_path,
+            version
+        )
+
+        print(
+            f"Dataset listo en: {real_path}"
+        )
+
+        return real_path
+
+    raise RuntimeError(
+        "Dataset no encontrado"
+    )
+
+
+def load_metadata(
+    base_path
+):
+
+    metadata_path = os.path.join(
+        base_path,
+        "HAM10000_metadata.csv"
+    )
+
+    df = pd.read_csv(
+        metadata_path
+    )
+
+    print(
+        "\nDistribución original:"
+    )
+
+    print(
+        df["dx"].value_counts()
+    )
+
+    return df
+
+
+def build_image_paths(
+    base_path,
+    df
+):
+
+    img_dir_1 = os.path.join(
+        base_path,
+        "HAM10000_images_part_1"
+    )
+
+    img_dir_2 = os.path.join(
+        base_path,
+        "HAM10000_images_part_2"
+    )
+
+    image_paths = {}
+
+    for folder in [
+        img_dir_1,
+        img_dir_2
+    ]:
+
+        for img in os.listdir(
+            folder
+        ):
+
+            image_id = img.split(
+                "."
+            )[0]
+
+            image_paths[
+                image_id
+            ] = os.path.join(
+                folder,
+                img
+            )
+
+    df["path"] = df[
+        "image_id"
+    ].map(
+        image_paths
+    )
+
+    print(
+        "\nSin ruta:",
+        df["path"].isna().sum()
+    )
+
+    return df
+
+
+def train_test_split_rest(
+    df,
+    n_train=50
+):
+
+    train_list = []
+    test_list = []
+
+    for label, group in df.groupby(
+        "dx"
+    ):
+
+        group = group.sample(
+            frac=1,
+            random_state=42
+        )
+
+        train = group.iloc[
+            :n_train
+        ]
+
+        test = group.iloc[
+            n_train:
+        ]
+
+        train_list.append(
+            train
+        )
+
+        test_list.append(
+            test
+        )
+
+    df_train = pd.concat(
+        train_list
+    ).reset_index(
+        drop=True
+    )
+
+    df_test = pd.concat(
+        test_list
+    ).reset_index(
+        drop=True
+    )
+
+    print(
+        "\nTrain:"
+    )
+
+    print(
+        df_train["dx"].value_counts()
+    )
+
+    print(
+        "\nTest:"
+    )
+
+    print(
+        df_test["dx"].value_counts()
+    )
+
+    return (
+        df_train,
+        df_test
+    )
+
+
+# =========================
+# DINOv2
+# =========================
+
+def load_dinov2():
+
+    model_name = (
+        "facebook/dinov2-small"
+    )
+
+    processor = AutoImageProcessor.from_pretrained(
+        model_name
+    )
+
+    model = AutoModel.from_pretrained(
+        model_name
+    )
+
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    model.to(
+        device
+    )
+
+    model.eval()
+
+    print(
+        f"\nModelo en {device}"
+    )
+
+    return (
+        processor,
+        model,
+        device
+    )
+
+
+def load_image(
+    path
+):
+
+    return Image.open(
+        path
+    ).convert(
+        "RGB"
+    )
+
+
+def get_patch_embedding(
+    image,
+    processor,
+    model,
+    device
+):
+
+    inputs = processor(
+        images=image,
+        return_tensors="pt"
+    ).to(
+        device
+    )
+
+    with torch.no_grad():
+
+        outputs = model(
+            **inputs
+        )
+
+    # quitar CLS
+    patches = outputs.last_hidden_state[
+        :,
+        1:,
+        :
+    ]
+
+    # [1,256,768]
+    # -> [16,16,768]
+
+    patches = patches.reshape(
+        16,
+        16,
+        384
+    )
+
+    return patches.cpu().numpy()
+
+
+def generate_patch_embeddings(
+    df,
+    processor,
+    model,
+    device
+):
+
+    embeddings = []
+    labels = []
+
+    total = len(
+        df
+    )
+
+    for i, (_, row) in enumerate(
+        df.iterrows()
+    ):
+
+        if i % 100 == 0:
+
+            print(
+                f"{i}/{total}"
+            )
+
+        try:
+
+            image = load_image(
+                row["path"]
+            )
+
+            emb = get_patch_embedding(
+                image,
+                processor,
+                model,
+                device
+            )
+
+            embeddings.append(
+                emb
+            )
+
+            labels.append(
+                row["dx"]
+            )
+
+        except Exception as e:
+
+            print(
+                f"Error: {e}"
+            )
+
+    return (
+        np.array(
+            embeddings
+        ),
+        np.array(
+            labels
+        )
+    )
+
+
+# =========================
+# CNN
+# =========================
+
+class PatchCNN(
+    nn.Module
+):
+
+    def __init__(
+        self,
+        num_classes=7
+    ):
+
+        super().__init__()
+
+        self.features = nn.Sequential(
+
+            nn.Conv2d(
+                384,
+                256,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.ReLU(),
+
+            nn.MaxPool2d(
+                2
+            ),
+
+            nn.Conv2d(
+                256,
+                128,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.ReLU(),
+
+            nn.MaxPool2d(
+                2
+            )
+        )
+
+        self.classifier = nn.Sequential(
+
+            nn.Flatten(),
+
+            nn.Linear(
+                128 * 4 * 4,
+                256
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(
+                0.3
+            ),
+
+            nn.Linear(
+                256,
+                num_classes
+            )
+        )
+
+    def forward(
+        self,
+        x
+    ):
+
+        # NHWC -> NCHW
+
+        x = x.permute(
+            0,
+            3,
+            1,
+            2
+        )
+
+        x = self.features(
+            x
+        )
+
+        x = self.classifier(
+            x
+        )
+
+        return x
+
+
+# =========================
+# TRAIN
+# =========================
+
+def train_patch_model(
+    emb_train,
+    labels_train,
+    epochs=100
+):
+
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    encoder = LabelEncoder()
+
+    y_train = encoder.fit_transform(
+        labels_train
+    )
+
+    X_train = torch.tensor(
+        emb_train,
+        dtype=torch.float32
+    ).to(
+        device
+    )
+
+    y_train = torch.tensor(
+        y_train,
+        dtype=torch.long
+    ).to(
+        device
+    )
+
+    model = PatchCNN(
+        num_classes=len(
+            encoder.classes_
+        )
+    ).to(
+        device
+    )
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=1e-3
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(
+        epochs
+    ):
+
+        model.train()
+
+        logits = model(
+            X_train
+        )
+
+        loss = criterion(
+            logits,
+            y_train
+        )
+
+        optimizer.zero_grad()
+
+        loss.backward()
+
+        optimizer.step()
+
+        if epoch % 10 == 0:
+
+            print(
+                f"Epoch {epoch} | "
+                f"Loss: {loss.item():.4f}"
+            )
+
+    return (
+        model,
+        encoder
+    )
+
+
+# =========================
+# EVAL
+# =========================
+
+def evaluate_patch_model(
+    model,
+    encoder,
+    emb_test,
+    labels_test
+):
+
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    X_test = torch.tensor(
+        emb_test,
+        dtype=torch.float32
+    ).to(
+        device
+    )
+
+    y_true = encoder.transform(
+        labels_test
+    )
+
+    model.eval()
+
+    with torch.no_grad():
+
+        logits = model(
+            X_test
+        )
+
+        preds = torch.argmax(
+            logits,
+            dim=1
+        )
+
+        y_pred = preds.cpu().numpy()
+
+    acc = accuracy_score(
+        y_true,
+        y_pred
+    )
+
+    print(
+        f"\nAccuracy: "
+        f"{acc:.4f}"
+    )
+
+    cm = confusion_matrix(
+        y_true,
+        y_pred
+    )
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=encoder.classes_,
+        columns=encoder.classes_
+    )
+
+    print(
+        "\nMatriz de confusión:"
+    )
+
+    print(
+        cm_df
+    )
+
+def evaluate_patch_model_2(
+    model,
+    encoder,
+    emb_test,
+    labels_test,
+    batch_size=32
+):
+
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    y_true = encoder.transform(
+        labels_test
+    )
+
+    model.eval()
+
+    all_preds = []
+
+    with torch.no_grad():
+
+        for i in range(
+            0,
+            len(emb_test),
+            batch_size
+        ):
+
+            batch = emb_test[
+                i:i + batch_size
+            ]
+
+            X_batch = torch.tensor(
+                batch,
+                dtype=torch.float32
+            ).to(
+                device
+            )
+
+            logits = model(
+                X_batch
+            )
+
+            preds = torch.argmax(
+                logits,
+                dim=1
+            )
+
+            all_preds.extend(
+                preds.cpu().numpy()
+            )
+
+    y_pred = np.array(
+        all_preds
+    )
+
+    acc = accuracy_score(
+        y_true,
+        y_pred
+    )
+
+    print(
+        f"\nAccuracy: {acc:.4f}"
+    )
+
+    cm = confusion_matrix(
+        y_true,
+        y_pred
+    )
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=encoder.classes_,
+        columns=encoder.classes_
+    )
+
+    print(
+        "\nMatriz de confusión:"
+    )
+
+    print(
+        cm_df
+    )
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+
+    base_path = download_dataset()
+
+    df = load_metadata(
+        base_path
+    )
+
+    df = build_image_paths(
+        base_path,
+        df
+    )
+
+    df_train, df_test = train_test_split_rest(
+        df,
+        n_train=50
+    )
+
+    processor, model, device = load_dinov2()
+
+    print(
+        "\nEmbeddings train..."
+    )
+
+    emb_train, labels_train = generate_patch_embeddings(
+        df_train,
+        processor,
+        model,
+        device
+    )
+
+    print(
+        "\nEmbeddings test..."
+    )
+
+    emb_test, labels_test = generate_patch_embeddings(
+        df_test,
+        processor,
+        model,
+        device
+    )
+
+    model, encoder = train_patch_model(
+        emb_train,
+        labels_train,
+        epochs=100
+    )
+
+    evaluate_patch_model_2(
+        model,
+        encoder,
+        emb_test,
+        labels_test,
+        batch_size=32
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+==================================================
+FICHERO: ./test4.py
+==================================================
+import kagglehub
+import os
+import pandas as pd
+from transformers import AutoImageProcessor, AutoModel
+import torch
+from peft import LoraConfig, get_peft_model
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torch
+import torch.nn as nn
+from PIL import Image
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    classification_report
+)
+
+import torch
+import numpy as np
+
+
+def evaluate_mlp(
+    X_test,
+    y_test,
+    mlp_model,
+    label_encoder,
+    device
+):
+
+    mlp_model.eval()
+
+    X_tensor = torch.tensor(
+        X_test,
+        dtype=torch.float32
+    ).to(device)
+
+    with torch.no_grad():
+
+        logits = mlp_model(
+            X_tensor
+        )
+
+        preds = torch.argmax(
+            logits,
+            dim=1
+        )
+
+    preds = preds.cpu().numpy()
+
+    y_pred = label_encoder.inverse_transform(
+        preds
+    )
+
+    # Accuracy
+    acc = accuracy_score(
+        y_test,
+        y_pred
+    )
+
+    print(
+        f"\nAccuracy: {acc:.4f}"
+    )
+
+    # Matriz de confusión
+    cm = confusion_matrix(
+        y_test,
+        y_pred,
+        labels=label_encoder.classes_
+    )
+
+    print(
+        "\nMatriz de confusión:"
+    )
+
+    print(
+        cm
+    )
+
+    # Opcional: métricas por clase
+    print(
+        "\nClassification report:"
+    )
+
+    print(
+        classification_report(
+            y_test,
+            y_pred
+        )
+    )
+
+    return acc, cm
+
+class EmbeddingMLP(nn.Module):
+
+    def __init__(
+        self,
+        input_dim,
+        num_classes
+    ):
+        super().__init__()
+
+        self.net = nn.Sequential(
+
+            nn.Linear(
+                input_dim,
+                128
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(
+                0.2
+            ),
+
+            nn.Linear(
+                128,
+                num_classes
+            )
+        )
+
+    def forward(
+        self,
+        x
+    ):
+        return self.net(x)
+
+
+def train_mlp(
+    X_train,
+    y_train,
+    device,
+    epochs=20,
+    batch_size=16,
+    lr=1e-3
+):
+
+    # Labels string -> int
+    encoder = LabelEncoder()
+
+    y_encoded = encoder.fit_transform(
+        y_train
+    )
+
+    # Numpy -> Torch
+    X_tensor = torch.tensor(
+        X_train,
+        dtype=torch.float32
+    )
+
+    y_tensor = torch.tensor(
+        y_encoded,
+        dtype=torch.long
+    )
+
+    dataset = TensorDataset(
+        X_tensor,
+        y_tensor
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True
+    )
+
+    input_dim = X_train.shape[1]
+
+    num_classes = len(
+        encoder.classes_
+    )
+
+    model = EmbeddingMLP(
+        input_dim,
+        num_classes
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr
+    )
+
+    model.train()
+
+    for epoch in range(
+        epochs
+    ):
+
+        epoch_loss = 0
+
+        for x_batch, y_batch in loader:
+
+            x_batch = x_batch.to(
+                device
+            )
+
+            y_batch = y_batch.to(
+                device
+            )
+
+            optimizer.zero_grad()
+
+            logits = model(
+                x_batch
+            )
+
+            loss = criterion(
+                logits,
+                y_batch
+            )
+
+            loss.backward()
+
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+        print(
+            f"MLP Epoch {epoch+1}/{epochs} "
+            f"Loss: {epoch_loss/len(loader):.4f}"
+        )
+
+    return model, encoder
+
+def generate_embeddings(
+    df,
+    model,
+    processor,
+    device
+):
+
+    embeddings = []
+    labels = []
+
+    model.eval()
+
+    with torch.no_grad():
+
+        for _, row in df.iterrows():
+
+            image = Image.open(
+                row["path"]
+            ).convert("RGB")
+
+            inputs = processor(
+                images=image,
+                return_tensors="pt"
+            )
+
+            pixel_values = inputs[
+                "pixel_values"
+            ].to(device)
+
+            outputs = model(
+                pixel_values=pixel_values
+            )
+
+            embedding = outputs.last_hidden_state[
+                :, 0
+            ]
+
+            embedding = embedding.squeeze(
+                0
+            ).cpu().numpy()
+
+            embeddings.append(
+                embedding
+            )
+
+            labels.append(
+                row["dx"]
+            )
+
+    X = np.array(
+        embeddings
+    )
+
+    y = np.array(
+        labels
+    )
+
+    print(
+        f"Embeddings generados: {X.shape}"
+    )
+
+    return X, y
+
+def train_lora(
+    model,
+    processor,
+    lora_df,
+    device,
+    epochs=15,
+    batch_size=8,
+    lr=1e-4
+):
+
+    # Labels
+    classes = sorted(lora_df["dx"].unique())
+    label_map = {
+        label: idx
+        for idx, label in enumerate(classes)
+    }
+
+    # Dataset
+    dataset = HAMDataset(
+        lora_df,
+        processor,
+        label_map
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True
+    )
+
+    # Insertar LoRA en atención del transformer
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["query", "value"],
+        lora_dropout=0.1,
+        bias="none"
+    )
+
+    model = get_peft_model(
+        model,
+        lora_config
+    )
+
+    # Head temporal
+    hidden_size = model.config.hidden_size
+
+    classifier = nn.Linear(
+        hidden_size,
+        len(classes)
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) +
+        list(classifier.parameters()),
+        lr=lr
+    )
+
+    model.train()
+
+    for epoch in range(epochs):
+
+        epoch_loss = 0
+
+        for pixel_values, labels in loader:
+
+            pixel_values = pixel_values.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+
+            outputs = model(
+                pixel_values=pixel_values
+            )
+
+            embeddings = outputs.last_hidden_state[:, 0]
+
+            logits = classifier(
+                embeddings
+            )
+
+            loss = criterion(
+                logits,
+                labels
+            )
+
+            loss.backward()
+
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+        print(
+            f"Epoch {epoch+1}/{epochs} "
+            f"Loss: {epoch_loss/len(loader):.4f}"
+        )
+
+    return model
+
+
+class HAMDataset(Dataset):
+    def __init__(self, df, processor, label_map):
+        self.df = df.reset_index(drop=True)
+        self.processor = processor
+        self.label_map = label_map
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        image = Image.open(row["path"]).convert("RGB")
+
+        inputs = self.processor(
+            images=image,
+            return_tensors="pt"
+        )
+
+        pixel_values = inputs["pixel_values"].squeeze(0)
+
+        label = self.label_map[row["dx"]]
+
+        return pixel_values, label
+# =========================
+# DATASET
+# =========================
+
+def download_dataset():
+    path = kagglehub.dataset_download("kmader/skin-cancer-mnist-ham10000")
+
+    # Caso 1: ya estamos dentro de la versión correcta
+    if "HAM10000_metadata.csv" in os.listdir(path):
+        print(f"Dataset listo en: {path}")
+        return path
+
+    # Caso 2: hay carpeta versions
+    versions_path = os.path.join(path, "versions")
+
+    if os.path.exists(versions_path):
+        version = os.listdir(versions_path)[0]
+        real_path = os.path.join(versions_path, version)
+        print(f"Dataset listo en: {real_path}")
+        return real_path
+
+    # fallback (por si cambia estructura)
+    raise RuntimeError(f"No se encontró estructura válida en: {path}")
+
+
+def build_image_paths(base_path, df):
+    img_dir_1 = os.path.join(base_path, "HAM10000_images_part_1")
+    img_dir_2 = os.path.join(base_path, "HAM10000_images_part_2")
+
+    image_paths = {}
+
+    for folder in [img_dir_1, img_dir_2]:
+        for img in os.listdir(folder):
+            image_id = img.split(".")[0]
+            image_paths[image_id] = os.path.join(folder, img)
+
+    df["path"] = df["image_id"].map(image_paths)
+
+    print("\nImágenes sin ruta:", df["path"].isna().sum())
+
+    return df
+
+def load_metadata(base_path):
+    metadata_path = os.path.join(base_path, "HAM10000_metadata.csv")
+    df = pd.read_csv(metadata_path)
+
+    print("\nDistribución original de clases:")
+    print(df["dx"].value_counts())
+
+    return df
+
+def load_dinov2():
+    #model_name = "facebook/dinov2-small"
+    model_name = "facebook/dinov2-base"
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+
+    model.eval()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+
+    print(f"Modelo cargado en {device}")
+
+    return processor, model, device
+
+
+def split_for_lora_mlp_test(
+    df,
+    lora_per_class=30,
+    mlp_per_class=50,
+    random_state=42
+):
+    lora_rows = []
+    mlp_rows = []
+    test_rows = []
+
+    for dx in sorted(df["dx"].unique()):
+
+        # Todas las imágenes de esa clase
+        class_df = df[df["dx"] == dx].sample(
+            frac=1,
+            random_state=random_state
+        ).reset_index(drop=True)
+
+        total_needed = lora_per_class + mlp_per_class
+
+        if len(class_df) < total_needed:
+            raise ValueError(
+                f"La clase {dx} solo tiene {len(class_df)} imágenes, "
+                f"pero necesitas {total_needed}"
+            )
+
+        # Split sin solapamiento
+        lora_split = class_df.iloc[:lora_per_class]
+        mlp_split = class_df.iloc[
+            lora_per_class:lora_per_class + mlp_per_class
+        ]
+        test_split = class_df.iloc[
+            lora_per_class + mlp_per_class:
+        ]
+
+        lora_rows.append(lora_split)
+        mlp_rows.append(mlp_split)
+        test_rows.append(test_split)
+
+    lora_df = pd.concat(lora_rows).reset_index(drop=True)
+    mlp_df = pd.concat(mlp_rows).reset_index(drop=True)
+    test_df = pd.concat(test_rows).reset_index(drop=True)
+
+    print("\nLoRA:")
+    print(lora_df["dx"].value_counts())
+
+    print("\nMLP:")
+    print(mlp_df["dx"].value_counts())
+
+    print("\nTest:")
+    print(test_df["dx"].value_counts())
+
+    return lora_df, mlp_df, test_df
+# =========================
+# MAIN
+# =========================
+
+def main():
+    # Dataset
+    base_path = download_dataset()
+    df = load_metadata(base_path)
+    df = build_image_paths(base_path, df)
+
+    # Modelo
+    processor, model, device = load_dinov2()
+    lora_df, mlp_df, test_df = split_for_lora_mlp_test(df)
+
+    lora_model = train_lora(
+    model=model,
+    processor=processor,
+    lora_df=lora_df,
+    device=device
+    )
+    X_train, y_train = generate_embeddings(
+        mlp_df,
+        lora_model,
+        processor,
+        device
+    )
+    
+    X_test, y_test = generate_embeddings(
+        test_df,
+        lora_model,
+        processor,
+        device
+    )
+    mlp_model, label_encoder = train_mlp(
+        X_train,
+        y_train,
+        device
+    )
+
+    acc, cm = evaluate_mlp(
+        X_test,
+        y_test,
+        mlp_model,
+        label_encoder,
+        device
+    )
+
+if __name__ == "__main__":
+    main()
+
+
+==================================================
+FICHERO: ./test.py
+==================================================
+import os
+import pandas as pd
+import kagglehub
+from transformers import AutoImageProcessor, AutoModel
+import torch
+from PIL import Image
+import numpy as np
+from sklearn.metrics import confusion_matrix
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, confusion_matrix
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+import numpy as np
+from sklearn.decomposition import PCA
+
+
+def apply_pca_95(
+    emb_train,
+    emb_test
+):
+    # Ajustar SOLO en train
+    pca = PCA(
+        n_components=0.95
+    )
+
+    emb_train_pca = pca.fit_transform(
+        emb_train
+    )
+
+    emb_test_pca = pca.transform(
+        emb_test
+    )
+
+    print(
+        f"\nDim original: "
+        f"{emb_train.shape[1]}"
+    )
+
+    print(
+        f"Dim reducida PCA: "
+        f"{emb_train_pca.shape[1]}"
+    )
+
+    return (
+        emb_train_pca,
+        emb_test_pca,
+        pca
+    )
+
+def analyze_pca_variance(emb_train):
+    
+    pca = PCA()
+    
+    pca.fit(emb_train)
+
+    cumulative_variance = np.cumsum(
+        pca.explained_variance_ratio_
+    )
+
+    print("\nVarianza acumulada:")
+
+    checkpoints = [
+        10,
+        20,
+        30,
+        50,
+        75,
+        100,
+        150,
+        200,
+        emb_train.shape[1]
+    ]
+
+    for n in checkpoints:
+
+        if n <= len(cumulative_variance):
+
+            variance = cumulative_variance[n - 1]
+
+            print(
+                f"{n} componentes -> "
+                f"{variance:.4f}"
+            )
+
+    # cuántos componentes para 95%
+    n_95 = np.argmax(
+        cumulative_variance >= 0.95
+    ) + 1
+
+    print(
+        f"\nComponentes para 95% "
+        f"de varianza: {n_95}"
+    )
+
+    return pca
+
+def evaluate_mlp(
+    model,
+    encoder,
+    emb_test,
+    labels_test
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    X_test = torch.tensor(
+        emb_test,
+        dtype=torch.float32
+    ).to(device)
+
+    y_true = encoder.transform(
+        labels_test
+    )
+
+    model.eval()
+
+    with torch.no_grad():
+
+        logits = model(X_test)
+
+        preds = torch.argmax(
+            logits,
+            dim=1
+        )
+
+        y_pred = preds.cpu().numpy()
+
+    # Accuracy
+    acc = accuracy_score(
+        y_true,
+        y_pred
+    )
+
+    print(f"\nMLP Accuracy: {acc:.4f}")
+
+    # confusion matrix
+    cm = confusion_matrix(
+        y_true,
+        y_pred
+    )
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=encoder.classes_,
+        columns=encoder.classes_
+    )
+
+    print("\nMatriz de confusión:")
+    print(cm_df)
+
+def train_mlp_classifier(
+    emb_train,
+    labels_train,
+    epochs=200,
+    lr=1e-3
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # labels string -> int
+    encoder = LabelEncoder()
+
+    y_train = encoder.fit_transform(labels_train)
+
+    # numpy -> torch
+    X_train = torch.tensor(
+        emb_train,
+        dtype=torch.float32
+    ).to(device)
+
+    y_train = torch.tensor(
+        y_train,
+        dtype=torch.long
+    ).to(device)
+
+    # modelo
+    input_dim = emb_train.shape[1]
+
+    model = EmbeddingClassifier(
+        input_dim=input_dim,
+        num_classes=len(encoder.classes_)
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr
+    )
+
+    # training loop
+    for epoch in range(epochs):
+
+        model.train()
+
+        logits = model(X_train)
+
+        loss = criterion(
+            logits,
+            y_train
+        )
+
+        optimizer.zero_grad()
+
+        loss.backward()
+
+        optimizer.step()
+
+        if epoch % 10 == 0:
+            print(
+                f"Epoch {epoch} | Loss: {loss.item():.4f}"
+            )
+
+    return model, encoder
+
+class EmbeddingClassifier(nn.Module):
+    def __init__(self, input_dim=101, num_classes=7):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            
+            # 384 -> 512
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            # 512 -> 256
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            # 256 -> 128
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            # salida
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+    
+
+
+# =========================
+# EMBEDDINGS (DINOv2)
+# =========================
+
+def load_dinov2():
+    #model_name = "facebook/dinov2-small"
+    model_name = "facebook/dinov2-base"
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+
+    model.eval()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+
+    print(f"Modelo cargado en {device}")
+
+    return processor, model, device
+
+
+def load_image(path):
+    return Image.open(path).convert("RGB")
+
+
+def get_embedding(image, processor, model, device):
+    inputs = processor(images=image, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    # CLS token → embedding global
+    embedding = outputs.last_hidden_state[:, 0, :]
+    #embedding = outputs.last_hidden_state.mean(dim=1)
+    return embedding.cpu().numpy().flatten()
+
+
+def generate_n_embeddings(df, processor, model, device, n=50):
+    embeddings = []
+    labels = []
+
+    for i, (_, row) in enumerate(df.head(n).iterrows()):
+        try:
+            image = load_image(row["path"])
+            emb = get_embedding(image, processor, model, device)
+
+            embeddings.append(emb)
+            labels.append(row["dx"])
+
+        except Exception as e:
+            print(f"Error en {row['path']}: {e}")
+
+    return np.array(embeddings), np.array(labels)
+
+# =========================
+# DATASET
+# =========================
+
+def download_dataset():
+    path = kagglehub.dataset_download("kmader/skin-cancer-mnist-ham10000")
+
+    # Caso 1: ya estamos dentro de la versión correcta
+    if "HAM10000_metadata.csv" in os.listdir(path):
+        print(f"Dataset listo en: {path}")
+        return path
+
+    # Caso 2: hay carpeta versions
+    versions_path = os.path.join(path, "versions")
+
+    if os.path.exists(versions_path):
+        version = os.listdir(versions_path)[0]
+        real_path = os.path.join(versions_path, version)
+        print(f"Dataset listo en: {real_path}")
+        return real_path
+
+    # fallback (por si cambia estructura)
+    raise RuntimeError(f"No se encontró estructura válida en: {path}")
+
+def load_metadata(base_path):
+    metadata_path = os.path.join(base_path, "HAM10000_metadata.csv")
+    df = pd.read_csv(metadata_path)
+
+    print("\nDistribución original de clases:")
+    print(df["dx"].value_counts())
+
+    return df
+
+
+def build_image_paths(base_path, df):
+    img_dir_1 = os.path.join(base_path, "HAM10000_images_part_1")
+    img_dir_2 = os.path.join(base_path, "HAM10000_images_part_2")
+
+    image_paths = {}
+
+    for folder in [img_dir_1, img_dir_2]:
+        for img in os.listdir(folder):
+            image_id = img.split(".")[0]
+            image_paths[image_id] = os.path.join(folder, img)
+
+    df["path"] = df["image_id"].map(image_paths)
+
+    print("\nImágenes sin ruta:", df["path"].isna().sum())
+
+    return df
+
+def sample_per_class(df, n_per_class=50):
+    df_sampled = pd.concat(
+        [
+            group.sample(min(len(group), n_per_class), random_state=42)
+            for _, group in df.groupby("dx")
+        ]
+    ).reset_index(drop=True)
+
+    print("\nDistribución tras sampling:")
+    print(df_sampled["dx"].value_counts())
+
+    return df_sampled
+
+def compute_centroids(embeddings, labels):
+    centroids = {}
+
+    for label in np.unique(labels):
+        class_embeddings = embeddings[labels == label]
+        centroids[label] = class_embeddings.mean(axis=0)
+
+    return centroids
+
+def predict(embedding, centroids):
+    best_label = None
+    best_dist = float("inf")
+
+    for label, centroid in centroids.items():
+        dist = np.linalg.norm(embedding - centroid)
+
+        if dist < best_dist:
+            best_dist = dist
+            best_label = label
+
+    return best_label
+
+def evaluate(embeddings, labels, centroids):
+    correct = 0
+
+    for emb, true_label in zip(embeddings, labels):
+        pred = predict(emb, centroids)
+
+        if pred == true_label:
+            correct += 1
+
+    acc = correct / len(labels)
+    print(f"Accuracy: {acc:.4f}")
+
+def train_test_split_rest(df, n_train=50):
+    train_list = []
+    test_list = []
+
+    for label, group in df.groupby("dx"):
+        group = group.sample(frac=1, random_state=42)  # shuffle
+
+        train = group.iloc[:n_train]
+        test = group.iloc[n_train:]  # TODO el resto
+
+        train_list.append(train)
+        test_list.append(test)
+
+    df_train = pd.concat(train_list).reset_index(drop=True)
+    df_test = pd.concat(test_list).reset_index(drop=True)
+
+    print("\nTrain distribution:")
+    print(df_train["dx"].value_counts())
+
+    print("\nTest distribution:")
+    print(df_test["dx"].value_counts())
+
+    return df_train, df_test
+
+def confusion_matrix_report(embeddings, labels, centroids):
+    y_true = []
+    y_pred = []
+
+    for emb, true_label in zip(embeddings, labels):
+        pred = predict(emb, centroids)
+
+        y_true.append(true_label)
+        y_pred.append(pred)
+
+    cm = confusion_matrix(y_true, y_pred, labels=np.unique(labels))
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=np.unique(labels),
+        columns=np.unique(labels)
+    )
+
+    print("\nMatriz de confusión:")
+    print(cm_df)
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    # Dataset
+    base_path = download_dataset()
+    df = load_metadata(base_path)
+    df = build_image_paths(base_path, df)
+
+    # Modelo
+    processor, model, device = load_dinov2()
+
+    df_sampled = sample_per_class(df, n_per_class=50)
+    df_train, df_test = train_test_split_rest(df, n_train=50)
+    emb_train, labels_train = generate_n_embeddings(
+        df_train, processor, model, device, n=len(df_train)
+    )
+
+    emb_test, labels_test = generate_n_embeddings(
+        df_test, processor, model, device, n=len(df_test)
+    )
+    analyze_pca_variance(
+        emb_train
+    )
+    emb_train_pca, emb_test_pca, pca = apply_pca_95(
+        emb_train,
+        emb_test
+    )
+
+    centroids = compute_centroids(emb_train_pca, labels_train)
+
+    evaluate(emb_test_pca, labels_test, centroids)
+
+    confusion_matrix_report(emb_test_pca, labels_test, centroids)
+
+    model, encoder = train_mlp_classifier(
+        emb_train,
+        labels_train,
+        epochs=200
+    )   
+
+    evaluate_mlp(
+        model,
+        encoder,
+        emb_test,
+        labels_test
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
