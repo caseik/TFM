@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 from pathlib import Path
 from typing import Any
+
+import torch
 
 from config import (
     CLASS_ORDER,
@@ -29,24 +32,23 @@ from model_runners.resnet50_runner import ResNet50Runner
 from model_runners.vit_b16_runner import ViTB16Runner
 
 
-def build_runner_registry(seed: int = 42) -> dict[str, Any]:
-    """
-    Registro único de modelos.
-
-    Se mantiene la batería amplia de contenido_ismael y se elimina el runner genérico
-    antiguo para que cada arquitectura tenga nombre propio en tablas y resultados.
-    """
-    return {
-        "centroid": CentroidRunner(),
-        "mlp": MLPRunner(),
-        "efficientnet_b0": EfficientNetB0Runner(seed=seed),
-        "convnext_tiny": ConvNeXtTinyRunner(seed=seed),
-        "mobilenet_v2": MobileNetV2Runner(seed=seed),
-        "vit_b16": ViTB16Runner(seed=seed),
-        "resnet50": ResNet50Runner(seed=seed),
-        "densenet121": DenseNet121Runner(seed=seed),
-        "inception_v3": InceptionV3Runner(seed=seed),
+def build_runner(runner_name: str, seed: int = 42) -> Any:
+    runners = {
+        "centroid": lambda: CentroidRunner(),
+        "mlp": lambda: MLPRunner(),
+        "efficientnet_b0": lambda: EfficientNetB0Runner(seed=seed),
+        "convnext_tiny": lambda: ConvNeXtTinyRunner(seed=seed),
+        "mobilenet_v2": lambda: MobileNetV2Runner(seed=seed),
+        "vit_b16": lambda: ViTB16Runner(seed=seed),
+        "resnet50": lambda: ResNet50Runner(seed=seed),
+        "densenet121": lambda: DenseNet121Runner(seed=seed),
+        "inception_v3": lambda: InceptionV3Runner(seed=seed),
     }
+
+    if runner_name not in runners:
+        raise ValueError(f"Runner desconocido: {runner_name}")
+
+    return runners[runner_name]()
 
 
 def build_experiment_list(
@@ -63,8 +65,10 @@ def build_experiment_list(
     scenario = SCENARIOS[scenario_name]
 
     base_experiments: list[dict[str, Any]] = []
+
     if not only_images:
         base_experiments.extend(EMBEDDING_EXPERIMENTS)
+
     if not only_embeddings:
         base_experiments.extend(IMAGE_EXPERIMENTS)
 
@@ -82,13 +86,23 @@ def build_experiment_list(
                 "test": scenario["test"],
                 "group_by": scenario["group_by"],
             }
+
             experiment["experiment_id"] = (
                 f"{scenario_name}_seed_{seed}_"
                 f"{experiment['feature_extractor']}_{experiment['runner']}"
             )
+
             experiments.append(experiment)
 
     return experiments
+
+
+def clear_memory() -> None:
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def run_experiments(
@@ -97,15 +111,25 @@ def run_experiments(
     results_dir: str | Path = "results",
 ) -> None:
     results_dir = Path(results_dir)
+
     metrics_generator = MetricsGenerator(
         class_order=CLASS_ORDER,
         output_dir=results_dir,
     )
-    feature_extractor = FeatureExtractor(cache_dir=results_dir / "cache")
 
-    for experiment in experiments:
+    feature_extractor = FeatureExtractor(
+        cache_dir=results_dir / "cache"
+    )
+
+    total_experiments = len(experiments)
+
+    for index, experiment in enumerate(experiments, start=1):
         print("\n" + "=" * 80)
-        print(f"Ejecutando experimento: {experiment['experiment_id']}")
+        print(f"Experimento {index}/{total_experiments}")
+        print(f"ID: {experiment['experiment_id']}")
+        print(f"Modelo: {experiment['runner']}")
+        print(f"Seed: {experiment['seed']}")
+        print(f"Escenario: {experiment['scenario']}")
         print("=" * 80)
 
         seed = int(experiment["seed"])
@@ -115,7 +139,11 @@ def run_experiments(
             split_dir=results_dir / "splits",
             export_splits=True,
         )
-        split_bundle = split_manager.prepare_split(dataset, experiment)
+
+        split_bundle = split_manager.prepare_split(
+            dataset,
+            experiment,
+        )
 
         if experiment["input_mode"] == "embeddings":
             split_bundle = feature_extractor.transform_split_bundle(
@@ -123,37 +151,89 @@ def run_experiments(
                 experiment["feature_extractor"],
             )
 
-        runners = build_runner_registry(seed=seed)
-        runner = runners[experiment["runner"]]
-
-        predictions = runner.run(split_bundle)
-
-        metrics_generator.process_experiment(
-            experiment,
-            predictions,
+        runner = build_runner(
+            experiment["runner"],
+            seed=seed,
         )
 
-        metrics_generator.export_tables()
+        try:
+            predictions = runner.run(split_bundle)
+
+            metrics_generator.process_experiment(
+                experiment,
+                predictions,
+            )
+
+            metrics_generator.export_tables()
+
+            print(f"\nExperimento completado: {experiment['experiment_id']}")
+            print(f"Resultados guardados en: {results_dir}")
+
+        except Exception as error:
+            print("\nERROR EN EXPERIMENTO")
+            print(f"ID: {experiment['experiment_id']}")
+            print(f"Modelo: {experiment['runner']}")
+            print(f"Error: {error}")
+
+            error_log = results_dir / "errors.log"
+            error_log.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(error_log, "a", encoding="utf-8") as file:
+                file.write(f"{experiment['experiment_id']} | {repr(error)}\n")
+
+        finally:
+            try:
+                del runner
+            except UnboundLocalError:
+                pass
+
+            try:
+                del predictions
+            except UnboundLocalError:
+                pass
+
+            clear_memory()
 
     performance, false_negatives = metrics_generator.export_tables()
 
-    print("\nTablas generadas:")
-    print(results_dir / "table_2_performance.csv")
-    print(results_dir / "table_3_false_negatives.csv")
-    print("\nResumen de rendimiento:")
-    print(performance[["Experiment ID", "Accuracy", "Balanced Accuracy", "Macro F1"]])
+    print("\n" + "=" * 80)
+    print("EJECUCIÓN FINALIZADA")
+    print("=" * 80)
+    print(f"Tabla de rendimiento: {results_dir / 'table_2_performance.csv'}")
+    print(f"Tabla de falsos negativos: {results_dir / 'table_3_false_negatives.csv'}")
+    print(f"Matrices de confusión: {results_dir / 'confusion_matrices'}")
+
+    if not performance.empty:
+        print("\nResumen de rendimiento:")
+        available_columns = [
+            column
+            for column in [
+                "Experiment ID",
+                "Accuracy",
+                "Balanced Accuracy",
+                "Macro F1",
+                "Weighted F1",
+                "mel Recall",
+                "mel Precision",
+            ]
+            if column in performance.columns
+        ]
+
+        print(performance[available_columns])
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Comparativa definitiva HAM10000: fine-tuning frente a embeddings."
     )
+
     parser.add_argument(
         "--scenario",
         default=DEFAULT_SCENARIO,
         choices=list(SCENARIOS.keys()),
         help="Escenario experimental.",
     )
+
     parser.add_argument(
         "--seeds",
         nargs="+",
@@ -161,26 +241,35 @@ def parse_args() -> argparse.Namespace:
         default=SEEDS,
         help="Semillas para repetir experimentos.",
     )
+
     parser.add_argument(
         "--only-embeddings",
         action="store_true",
         help="Ejecuta solo DINOv2 + centroides/MLP.",
     )
+
     parser.add_argument(
         "--only-images",
         action="store_true",
         help="Ejecuta solo modelos de imagen con fine-tuning.",
     )
+
     parser.add_argument(
         "--results-dir",
         default="results",
         help="Directorio de salida para tablas, splits, caché y matrices.",
     )
+
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.only_embeddings and args.only_images:
+        raise ValueError(
+            "No puedes usar --only-embeddings y --only-images a la vez."
+        )
 
     dataset_manager = DatasetManager()
     experiment_logger = ExperimentLogger()
@@ -198,7 +287,13 @@ def main() -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
 
     experiment_logger.register_batch(experiments)
-    experiment_logger.export_table(results_dir / "table_1_experimental_plan.csv")
+    experiment_logger.export_table(
+        results_dir / "table_1_experimental_plan.csv"
+    )
+
+    print("\nPlan experimental generado:")
+    print(f"Número de experimentos: {len(experiments)}")
+    print(f"Tabla: {results_dir / 'table_1_experimental_plan.csv'}")
 
     run_experiments(
         dataset=dataset,
